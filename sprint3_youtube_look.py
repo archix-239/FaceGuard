@@ -2,11 +2,12 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from mediapipe.framework.formats import landmark_pb2
 import tensorflow as tf
 import numpy as np
 from collections import deque
 import os
+from mediapipe.tasks.python.vision.drawing_utils import draw_landmarks as mp_draw_landmarks, DrawingSpec as MpDrawingSpec
+from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarksConnections
 
 # ==========================================
 # 1. CHARGEMENT IA & LISSAGE (SMOOTHING)
@@ -31,8 +32,6 @@ preds_buffer = deque(maxlen=BUFFER_SIZE)
 # ==========================================
 # 2. SETUP MEDIAPIPE (Avec utilitaires de dessin)
 # ==========================================
-mp_drawing = mp.solutions.drawing_utils
-mp_face_mesh = mp.solutions.face_mesh # Utilisé juste pour récupérer le motif de la toile (Tessellation)
 
 base_options = python.BaseOptions(model_asset_path='models/face_landmarker.task')
 options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
@@ -73,18 +72,13 @@ while cap.isOpened():
         
         # --- A. DESSIN DU MASQUE FILAIRE (Wireframe) ---
         # Conversion des landmarks pour l'utilitaire de dessin
-        face_proto = landmark_pb2.NormalizedLandmarkList()
-        face_proto.landmark.extend([
-            landmark_pb2.NormalizedLandmark(x=l.x, y=l.y, z=l.z) for l in landmarks
-        ])
-        
-        # Dessin de la toile blanche fine
-        mp_drawing.draw_landmarks(
+        # Dessin de la toile blanche fine (Tasks API — pas besoin de protobuf)
+        mp_draw_landmarks(
             image=image,
-            landmark_list=face_proto,
-            connections=mp_face_mesh.FACEMESH_TESSELATION,
-            landmark_drawing_spec=None, # Pas de gros points
-            connection_drawing_spec=mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0)
+            landmark_list=landmarks,
+            connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
+            landmark_drawing_spec=None,
+            connection_drawing_spec=MpDrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0)
         )
 
         # --- B. PRÉTRAITEMENT & PRÉDICTION ---
