@@ -1,0 +1,13 @@
+# Environnement virtuel
+venv/
+__pycache__/
+*.pyc
+
+# Modèles IA (trop lourds pour Git standard)
+models/*.h5
+models/*.keras
+models/*.task
+
+# Données et logs
+data/*
+.DS_Store
