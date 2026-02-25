@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/DevEnix/Projets_Enix/Compteur_Automatique/compteur_ciment/dashboard/**)"
+    ]
+  }
+}
