@@ -1,13 +1,74 @@
-# Environnement virtuel
+# ==========================================
+# PYTHON / BACKEND
+# ==========================================
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
 
-# Modèles IA (trop lourds pour Git standard)
+# ==========================================
+# MODÈLES IA (trop lourds pour Git standard)
+# ==========================================
 models/*.h5
 models/*.keras
 models/*.task
 
-# Données et logs
+# ==========================================
+# DONNÉES ET LOGS
+# ==========================================
 data/*
+*.log
+logs/
+
+# ==========================================
+# FRONTEND (Next.js + TypeScript + pnpm)
+# ==========================================
+
+# Dépendances (installer via pnpm install)
+frontend/node_modules/
+
+# Build Next.js
+frontend/.next/
+frontend/out/
+
+# Cache TypeScript
+frontend/*.tsbuildinfo
+
+# Cache pnpm
+frontend/.pnpm-store/
+.pnpm-store/
+pnpm-debug.log*
+
+# Cache ESLint / outils
+frontend/.eslintcache
+frontend/.cache
+
+# Logs de dev
+frontend/next_dev.log
+
+# ==========================================
+# VARIABLES D'ENVIRONNEMENT
+# ==========================================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+frontend/.env
+frontend/.env.local
+frontend/.env*.local
+
+# ==========================================
+# OS / ÉDITEUR
+# ==========================================
 .DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
