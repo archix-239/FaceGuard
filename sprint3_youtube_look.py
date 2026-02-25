@@ -12,7 +12,7 @@ from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarksConnectio
 # ==========================================
 # 1. CHARGEMENT IA & LISSAGE (SMOOTHING)
 # ==========================================
-MODEL_PATH = 'models/faceguard_best_model_Version_25-065Epochs.keras'
+MODEL_PATH = 'models/faceguard_convnext.keras'
 print(f"[INFO] Chargement du modèle : {MODEL_PATH}")
 
 try:
@@ -23,10 +23,10 @@ except Exception as e:
     model_loaded = False
 
 # Ordre d'affichage comme sur ta capture YouTube
-EMOTION_CLASSES = ['ANGRY', 'CONTEMPT', 'DISGUST', 'FEAR', 'HAPPY', 'NEUTRAL', 'SAD', 'SURPRISE']
+EMOTION_CLASSES = ['anger', 'contempt', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
 
 # Le Buffer pour la stabilisation (Moyenne sur les 10 dernières frames)
-BUFFER_SIZE = 10
+BUFFER_SIZE = 30
 preds_buffer = deque(maxlen=BUFFER_SIZE)
 
 # ==========================================
@@ -94,7 +94,7 @@ while cap.isOpened():
             clahe_img = clahe.apply(gray)
             final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
 
-            ai_input = cv2.resize(final_input, (48, 48))
+            ai_input = cv2.resize(final_input, (224, 224))
             tensor = np.expand_dims(ai_input, axis=0)
             
             raw_preds = emotion_model(tensor, training=False)[0].numpy()
@@ -120,7 +120,7 @@ while cap.isOpened():
 
             # 2. La Boîte Droite (Détail de toutes les émotions)
             # Ordre d'affichage inspiré de la vidéo
-            display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
+            display_order = ['anger', 'contempt', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
             
             image = draw_transparent_box(image, box_right_x, box_right_y, 200, 180, alpha=0.5)
             
