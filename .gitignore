@@ -7,6 +7,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+#dossier de videos enregistrées
+runs/
+
 # ==========================================
 # MODÈLES IA (trop lourds pour Git standard)
 # ==========================================
@@ -96,6 +99,7 @@ ehthumbs.db
 .next
 
 # Logs
+logs/
 logs
 *.log
 npm-debug.log*
