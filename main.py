@@ -72,8 +72,10 @@ EMOTION_CLASSES = config["emotion"]["classes"]
 WORK_FRAME_ENABLED = bool(config.get("work_frame", {}).get("enabled", False))
 WORK_FRAME_WIDTH = int(config.get("work_frame", {}).get("width", 640))
 WORK_FRAME_HEIGHT = int(config.get("work_frame", {}).get("height", 360))
-INFER_FPS = float(config.get("inference", {}).get("fps", 8.0))
-INFER_INTERVAL_MS = 0.0 if INFER_FPS <= 0 else (1000.0 / INFER_FPS)
+infer_cfg_fps = config.get("inference", {}).get("fps", 8.0)
+INFER_FPS = float(infer_cfg_fps) if infer_cfg_fps is not None else 0.0
+INFER_ENABLED = INFER_FPS > 0.0
+INFER_INTERVAL_MS = (1000.0 / INFER_FPS) if INFER_ENABLED else None
 
 print(f"[⏳] Chargement du modèle IA lourd ({MODEL_PATH})... Cela peut prendre 30 secondes.")
 try:
@@ -258,35 +260,32 @@ try:
             y_max = max(0, min(img_h, int(y_max_w * scale_y)))
 
             if (x_max_w - x_min_w) > 40:
-                if next_infer_ts_ms is None:
-                    next_infer_ts_ms = clock_ts_ms
-
-                should_infer = INFER_INTERVAL_MS == 0.0 or clock_ts_ms >= next_infer_ts_ms
-                if should_infer:
-                    with Timer(frame_timings.timings_ms, "preprocess"):
-                        face_crop = work_frame[y_min_w:y_max_w, x_min_w:x_max_w]
-                        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                        clahe_img = clahe.apply(gray)
-                        final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
-
-                        ai_input = cv2.resize(final_input, (48, 48))
-                        tensor = np.expand_dims(ai_input, axis=0)
-
-                    with Timer(frame_timings.timings_ms, "infer"):
-                        raw_preds = emotion_model(tensor, training=False)[0].numpy()
-                        preds_buffer.append(raw_preds)
-                        last_prediction = np.mean(preds_buffer, axis=0)
-
-                    infer_ran = True
-                    infer_count += 1
-                    if INFER_INTERVAL_MS == 0.0:
+                if INFER_ENABLED:
+                    if next_infer_ts_ms is None:
                         next_infer_ts_ms = clock_ts_ms
-                    else:
-                        next_infer_ts_ms += INFER_INTERVAL_MS
-                        while next_infer_ts_ms <= clock_ts_ms:
-                            next_infer_ts_ms += INFER_INTERVAL_MS
 
-                valid_quality = True
+                    should_infer = clock_ts_ms >= next_infer_ts_ms
+                    if should_infer:
+                        with Timer(frame_timings.timings_ms, "preprocess"):
+                            face_crop = work_frame[y_min_w:y_max_w, x_min_w:x_max_w]
+                            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                            clahe_img = clahe.apply(gray)
+                            final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
+
+                            ai_input = cv2.resize(final_input, (48, 48))
+                            tensor = np.expand_dims(ai_input, axis=0)
+
+                        with Timer(frame_timings.timings_ms, "infer"):
+                            raw_preds = emotion_model(tensor, training=False)[0].numpy()
+                            preds_buffer.append(raw_preds)
+                            last_prediction = np.mean(preds_buffer, axis=0)
+
+                        infer_ran = True
+                        infer_count += 1
+                        # resync sur l'horloge courante: on drop les inférences manquées
+                        next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS
+
+                    valid_quality = True
 
             if len(preds_buffer) > 0:
                 top_2_idx = last_prediction.argsort()[-2:][::-1]

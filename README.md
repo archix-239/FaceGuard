@@ -73,6 +73,7 @@ work_frame:
 inference:
   fps: 8.0
 ```
+- `inference.fps: 0` (ou `null`) désactive l’inférence (mode mesure pipeline sans IA).
 
 ## Record / Replay
 - Enregistrer une session:
