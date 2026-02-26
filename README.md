@@ -46,6 +46,20 @@ camera:
 python main.py --config configs/custom.yaml
 ```
 
+- Mode UI minimal (sans tesselation):
+```bash
+python main.py --ui min
+```
+- Mode UI off (pas de fenêtre, logs/profiling actifs):
+```bash
+python main.py --ui off
+```
+
+- Run benchmark headless avec durée max:
+```bash
+python main.py --ui off --max-seconds 30
+```
+
 ## Record / Replay
 - Enregistrer une session:
 ```bash

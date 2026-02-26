@@ -31,9 +31,11 @@ clahe:
   tile_grid_size: [8, 8]
 
 ui:
+  mode: full
   window_name: FaceGuard V2.0 - Edition Industrielle
 
 runtime:
   outdir: runs
+  max_seconds: null
   metrics_filename: metrics.jsonl
   video_filename: video.mp4
