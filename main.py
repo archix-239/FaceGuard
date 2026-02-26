@@ -73,7 +73,7 @@ WORK_FRAME_ENABLED = bool(config.get("work_frame", {}).get("enabled", False))
 WORK_FRAME_WIDTH = int(config.get("work_frame", {}).get("width", 640))
 WORK_FRAME_HEIGHT = int(config.get("work_frame", {}).get("height", 360))
 INFER_FPS = float(config.get("inference", {}).get("fps", 8.0))
-INFER_INTERVAL_S = 0.0 if INFER_FPS <= 0 else (1.0 / INFER_FPS)
+INFER_INTERVAL_MS = 0.0 if INFER_FPS <= 0 else (1000.0 / INFER_FPS)
 
 print(f"[⏳] Chargement du modèle IA lourd ({MODEL_PATH})... Cela peut prendre 30 secondes.")
 try:
@@ -85,7 +85,7 @@ except Exception as e:
 
 preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
 last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
-last_infer_time = 0.0
+next_infer_ts_ms = None
 
 print("[⏳] Initialisation des capteurs géométriques...")
 base_options = python.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH)
@@ -194,6 +194,13 @@ try:
         if not success:
             break
 
+        if args.replay:
+            clock_ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if clock_ts_ms <= 0:
+                clock_ts_ms = float(frame_ts_ms)
+        else:
+            clock_ts_ms = time.time() * 1000.0
+
         frame_vis = frame_raw.copy()
         img_h, img_w, _ = frame_raw.shape
 
@@ -222,6 +229,7 @@ try:
         activation = 0.0
         pose_text = "INCONNU"
         valid_quality = False
+        infer_ran = False
         is_asymmetric = False
         x_min = y_min = x_max = y_max = None
 
@@ -248,11 +256,11 @@ try:
             y_min = max(0, min(img_h, int(y_min_w * scale_y)))
             y_max = max(0, min(img_h, int(y_max_w * scale_y)))
 
-            infer_ran = False
-
             if (x_max_w - x_min_w) > 40:
-                now_s = time.perf_counter()
-                should_infer = INFER_INTERVAL_S == 0.0 or (now_s - last_infer_time) >= INFER_INTERVAL_S
+                if next_infer_ts_ms is None:
+                    next_infer_ts_ms = clock_ts_ms
+
+                should_infer = INFER_INTERVAL_MS == 0.0 or clock_ts_ms >= next_infer_ts_ms
                 if should_infer:
                     with Timer(frame_timings.timings_ms, "preprocess"):
                         face_crop = work_frame[y_min_w:y_max_w, x_min_w:x_max_w]
@@ -268,8 +276,13 @@ try:
                         preds_buffer.append(raw_preds)
                         last_prediction = np.mean(preds_buffer, axis=0)
 
-                    last_infer_time = now_s
                     infer_ran = True
+                    if INFER_INTERVAL_MS == 0.0:
+                        next_infer_ts_ms = clock_ts_ms
+                    else:
+                        next_infer_ts_ms += INFER_INTERVAL_MS
+                        while next_infer_ts_ms <= clock_ts_ms:
+                            next_infer_ts_ms += INFER_INTERVAL_MS
 
                 valid_quality = True
 
@@ -363,6 +376,7 @@ try:
         frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
         frame_timings.pose = pose_text
         frame_timings.valid_quality = valid_quality
+        frame_timings.infer_ran = infer_ran
         frame_timings.emotion_top1 = dom_emo
         frame_timings.emotion_p = float(activation / 100.0)
         frame_timings.threat_score = int(threat_score)

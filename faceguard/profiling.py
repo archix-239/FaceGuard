@@ -33,6 +33,7 @@ class FrameTimings:
     has_face: bool = False
     pose: str = "INCONNU"
     valid_quality: bool = False
+    infer_ran: bool = False
     timings_ms: Dict[str, float] = field(default_factory=dict)
     emotion_top1: str = "SCANNING..."
     emotion_p: float = 0.0
@@ -45,6 +46,7 @@ class FrameTimings:
             "has_face": self.has_face,
             "pose": self.pose,
             "valid_quality": self.valid_quality,
+            "infer_ran": self.infer_ran,
             "timings_ms": self.timings_ms,
             "emotion_top1": self.emotion_top1,
             "emotion_p": self.emotion_p,
