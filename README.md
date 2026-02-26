@@ -60,6 +60,21 @@ python main.py --ui off
 python main.py --ui off --max-seconds 30
 ```
 
+- Downscale pipeline (work frame) via config:
+```yaml
+work_frame:
+  enabled: true
+  width: 640
+  height: 360
+```
+
+- Scheduler inférence (cadence décorrélée de la caméra):
+```yaml
+inference:
+  fps: 8.0
+```
+- `inference.fps: 0` (ou `null`) désactive l’inférence (mode mesure pipeline sans IA).
+
 ## Record / Replay
 - Enregistrer une session:
 ```bash

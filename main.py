@@ -69,6 +69,13 @@ video_path = os.path.join(run_dir, config["runtime"]["video_filename"])
 MODEL_PATH = config["models"]["emotion_model_path"]
 FACE_LANDMARKER_PATH = config["models"]["face_landmarker_path"]
 EMOTION_CLASSES = config["emotion"]["classes"]
+WORK_FRAME_ENABLED = bool(config.get("work_frame", {}).get("enabled", False))
+WORK_FRAME_WIDTH = int(config.get("work_frame", {}).get("width", 640))
+WORK_FRAME_HEIGHT = int(config.get("work_frame", {}).get("height", 360))
+infer_cfg_fps = config.get("inference", {}).get("fps", 8.0)
+INFER_FPS = float(infer_cfg_fps) if infer_cfg_fps is not None else 0.0
+INFER_ENABLED = INFER_FPS > 0.0
+INFER_INTERVAL_MS = (1000.0 / INFER_FPS) if INFER_ENABLED else None
 
 print(f"[⏳] Chargement du modèle IA lourd ({MODEL_PATH})... Cela peut prendre 30 secondes.")
 try:
@@ -79,6 +86,8 @@ except Exception as e:
     exit()
 
 preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
+last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
+next_infer_ts_ms = None
 
 print("[⏳] Initialisation des capteurs géométriques...")
 base_options = python.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH)
@@ -167,6 +176,7 @@ frame_idx = 0
 writer = None
 run_start = time.perf_counter()
 interrupted = False
+infer_count = 0
 
 try:
     while cap.isOpened():
@@ -187,8 +197,24 @@ try:
         if not success:
             break
 
+        if args.replay:
+            clock_ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if clock_ts_ms <= 0:
+                clock_ts_ms = float(frame_ts_ms)
+        else:
+            clock_ts_ms = time.time() * 1000.0
+
         frame_vis = frame_raw.copy()
         img_h, img_w, _ = frame_raw.shape
+
+        if WORK_FRAME_ENABLED:
+            work_frame = cv2.resize(frame_raw, (WORK_FRAME_WIDTH, WORK_FRAME_HEIGHT))
+        else:
+            work_frame = frame_raw
+
+        work_h, work_w, _ = work_frame.shape
+        scale_x = img_w / work_w
+        scale_y = img_h / work_h
 
         if args.record and writer is None:
             fps = cap.get(cv2.CAP_PROP_FPS)
@@ -198,7 +224,7 @@ try:
             writer = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
 
         with Timer(frame_timings.timings_ms, "mediapipe"):
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB))
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB))
             res = detector.detect(mp_image)
 
         threat_score = 0
@@ -206,6 +232,7 @@ try:
         activation = 0.0
         pose_text = "INCONNU"
         valid_quality = False
+        infer_ran = False
         is_asymmetric = False
         x_min = y_min = x_max = y_max = None
 
@@ -217,39 +244,53 @@ try:
             pose_text = get_head_pose(landmarks)
 
             if pose_text == "FACE":
-                asym_score = calculate_global_asymmetry(landmarks, img_w, img_h)
+                asym_score = calculate_global_asymmetry(landmarks, work_w, work_h)
                 if asym_score > float(config["asymmetry"]["threshold"]):
                     is_asymmetric = True
                     threat_score += 40
 
             x_vals = [l.x for l in landmarks]
             y_vals = [l.y for l in landmarks]
-            x_min, x_max = max(0, int(min(x_vals) * img_w) - 10), min(img_w, int(max(x_vals) * img_w) + 10)
-            y_min, y_max = max(0, int(min(y_vals) * img_h) - 20), min(img_h, int(max(y_vals) * img_h) + 10)
+            x_min_w, x_max_w = max(0, int(min(x_vals) * work_w) - 10), min(work_w, int(max(x_vals) * work_w) + 10)
+            y_min_w, y_max_w = max(0, int(min(y_vals) * work_h) - 20), min(work_h, int(max(y_vals) * work_h) + 10)
 
-            averaged_preds = np.zeros(len(EMOTION_CLASSES))
+            x_min = max(0, min(img_w, int(x_min_w * scale_x)))
+            x_max = max(0, min(img_w, int(x_max_w * scale_x)))
+            y_min = max(0, min(img_h, int(y_min_w * scale_y)))
+            y_max = max(0, min(img_h, int(y_max_w * scale_y)))
 
-            if (x_max - x_min) > 40:
-                with Timer(frame_timings.timings_ms, "preprocess"):
-                    face_crop = frame_raw[y_min:y_max, x_min:x_max]
-                    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                    clahe_img = clahe.apply(gray)
-                    final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
+            if (x_max_w - x_min_w) > 40:
+                if INFER_ENABLED:
+                    if next_infer_ts_ms is None:
+                        next_infer_ts_ms = clock_ts_ms
 
-                    ai_input = cv2.resize(final_input, (48, 48))
-                    tensor = np.expand_dims(ai_input, axis=0)
+                    should_infer = clock_ts_ms >= next_infer_ts_ms
+                    if should_infer:
+                        with Timer(frame_timings.timings_ms, "preprocess"):
+                            face_crop = work_frame[y_min_w:y_max_w, x_min_w:x_max_w]
+                            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                            clahe_img = clahe.apply(gray)
+                            final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
 
-                with Timer(frame_timings.timings_ms, "infer"):
-                    raw_preds = emotion_model(tensor, training=False)[0].numpy()
-                    preds_buffer.append(raw_preds)
-                    averaged_preds = np.mean(preds_buffer, axis=0)
+                            ai_input = cv2.resize(final_input, (48, 48))
+                            tensor = np.expand_dims(ai_input, axis=0)
 
-                valid_quality = True
+                        with Timer(frame_timings.timings_ms, "infer"):
+                            raw_preds = emotion_model(tensor, training=False)[0].numpy()
+                            preds_buffer.append(raw_preds)
+                            last_prediction = np.mean(preds_buffer, axis=0)
+
+                        infer_ran = True
+                        infer_count += 1
+                        # resync sur l'horloge courante: on drop les inférences manquées
+                        next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS
+
+                    valid_quality = True
 
             if len(preds_buffer) > 0:
-                top_2_idx = averaged_preds.argsort()[-2:][::-1]
+                top_2_idx = last_prediction.argsort()[-2:][::-1]
                 dom_emo = EMOTION_CLASSES[top_2_idx[0]]
-                activation = averaged_preds[top_2_idx[0]] * 100
+                activation = last_prediction[top_2_idx[0]] * 100
 
                 if dom_emo in ['ANGRY', 'CONTEMPT']:
                     threat_score += int(config["threat"]["angry_contempt_bonus"])
@@ -281,7 +322,7 @@ try:
                         y_offset = box_right_y + 20
                         for emo in display_order:
                             idx = EMOTION_CLASSES.index(emo)
-                            score = averaged_preds[idx] * 100
+                            score = last_prediction[idx] * 100
                             thickness = 2 if emo == dom_emo else 1
                             color = (255, 255, 255) if emo == dom_emo else (180, 180, 180)
                             cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
@@ -322,6 +363,7 @@ try:
                     cv2.putText(frame_vis, f"THREAT: {threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                     cv2.putText(frame_vis, f"POSE: {pose_text}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                     cv2.putText(frame_vis, f"INFER_OK: {valid_quality}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(frame_vis, f"INFER_RAN: {infer_ran}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
                 cv2.imshow(config["ui"]["window_name"], frame_vis)
                 should_quit = (cv2.waitKey(5) & 0xFF == 27)
@@ -335,6 +377,7 @@ try:
         frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
         frame_timings.pose = pose_text
         frame_timings.valid_quality = valid_quality
+        frame_timings.infer_ran = infer_ran
         frame_timings.emotion_top1 = dom_emo
         frame_timings.emotion_p = float(activation / 100.0)
         frame_timings.threat_score = int(threat_score)
@@ -354,6 +397,9 @@ finally:
     profiler.print_summary()
     profiler.close()
 
+run_duration_sec = max(time.perf_counter() - run_start, 1e-9)
+effective_infer_fps = infer_count / run_duration_sec
+
 print(f"[✅] Run ID: {run_id}")
 print(f"[✅] Metrics: {metrics_path}")
 if writer is not None:
@@ -361,3 +407,6 @@ if writer is not None:
     print(f"[✅] Video: {video_path} ({mode})")
 if interrupted:
     print("[✅] Run interrompu proprement.")
+print(f"[✅] infer_count: {infer_count}")
+print(f"[✅] duration_sec: {run_duration_sec:.2f}")
+print(f"[✅] effective_infer_fps: {effective_infer_fps:.2f}")

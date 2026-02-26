@@ -39,3 +39,11 @@ runtime:
   max_seconds: null
   metrics_filename: metrics.jsonl
   video_filename: video.mp4
+
+inference:
+  fps: 8.0
+
+work_frame:
+  enabled: true
+  width: 640
+  height: 360
