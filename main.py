@@ -12,15 +12,17 @@ import math
 import os
 import time
 
+from faceguard.config import load_config
 from faceguard.profiling import Timer, FrameTimings, RunProfiler
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FaceGuard runtime")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML configuration file")
     parser.add_argument("--record", action="store_true", help="Record processed session video + metrics")
     parser.add_argument("--replay", type=str, default=None, help="Replay from an existing video file")
     parser.add_argument("--no-ui", action="store_true", help="Disable OpenCV window rendering")
-    parser.add_argument("--outdir", type=str, default="runs", help="Output directory for runs")
+    parser.add_argument("--outdir", type=str, default=None, help="Output directory for runs")
     parser.add_argument("--record-overlay", action="store_true", help="Record annotated frames instead of raw frames")
     return parser.parse_args()
 
@@ -42,19 +44,21 @@ print("🚀 DÉMARRAGE DE FACEGUARD V2.0 (SYSTÈME COMPLET) 🚀")
 print("="*50 + "\n")
 
 args = parse_args()
+config = load_config(args.config)
+
 if args.record and args.replay:
     raise SystemExit("❌ --record et --replay ne peuvent pas être utilisés ensemble.")
 if args.replay and not os.path.exists(args.replay):
     raise SystemExit(f"❌ Fichier replay introuvable: {args.replay}")
 
-run_id, run_dir = create_run_dir(args.outdir, args.replay)
-metrics_path = os.path.join(run_dir, "metrics.jsonl")
-video_path = os.path.join(run_dir, "video.mp4")
+run_outdir = args.outdir if args.outdir else config["runtime"]["outdir"]
+run_id, run_dir = create_run_dir(run_outdir, args.replay)
+metrics_path = os.path.join(run_dir, config["runtime"]["metrics_filename"])
+video_path = os.path.join(run_dir, config["runtime"]["video_filename"])
 
-# ==========================================
-# 1. CHARGEMENT DU "TANK" IA (CONVNEXT)
-# ==========================================
-MODEL_PATH = 'models/faceguard_best_model_Version_25-065Epochs.keras'
+MODEL_PATH = config["models"]["emotion_model_path"]
+FACE_LANDMARKER_PATH = config["models"]["face_landmarker_path"]
+EMOTION_CLASSES = config["emotion"]["classes"]
 
 print(f"[⏳] Chargement du modèle IA lourd ({MODEL_PATH})... Cela peut prendre 30 secondes.")
 try:
@@ -64,24 +68,18 @@ except Exception as e:
     print(f"[❌] ERREUR FATALE : Impossible de charger l'IA.\n{e}")
     exit()
 
-EMOTION_CLASSES = ['ANGRY', 'CONTEMPT', 'DISGUST', 'FEAR', 'HAPPY', 'NEUTRAL', 'SAD', 'SURPRISE']
+preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
 
-# Buffer de lissage (15 frames = ~0.5 sec)
-preds_buffer = deque(maxlen=15)
-
-# ==========================================
-# 2. SETUP MEDIAPIPE & CLAHE
-# ==========================================
 print("[⏳] Initialisation des capteurs géométriques...")
-base_options = python.BaseOptions(model_asset_path='models/face_landmarker.task')
+base_options = python.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH)
 options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
 detector = vision.FaceLandmarker.create_from_options(options)
 
-clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+clahe = cv2.createCLAHE(
+    clipLimit=float(config["clahe"]["clip_limit"]),
+    tileGridSize=tuple(config["clahe"]["tile_grid_size"]),
+)
 
-# ==========================================
-# 3. MOTEUR MATHÉMATIQUE (ASYMÉTRIE)
-# ==========================================
 SYMMETRY_PAIRS = [
     (55, 285), (105, 334), (70, 300), (133, 362), (33, 263),
     (159, 386), (240, 460), (61, 291), (37, 267), (17, 314), (58, 288), (172, 397)
@@ -138,24 +136,18 @@ def calculate_global_asymmetry(landmarks, w, h):
     return (total_deviation / len(SYMMETRY_PAIRS)) * 100
 
 
-# ==========================================
-# 4. FONCTION D'INTERFACE (UI)
-# ==========================================
 def draw_transparent_box(image, x, y, w, h, alpha=0.6):
     overlay = image.copy()
     cv2.rectangle(overlay, (x, y), (x + w, y + h), (30, 30, 30), -1)
     return cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
 
 
-# ==========================================
-# 5. BOUCLE PRINCIPALE (LE COEUR DU SYSTÈME)
-# ==========================================
-input_source = args.replay if args.replay else 0
+input_source = args.replay if args.replay else int(config["camera"]["index"])
 print("[✅] Démarrage de la caméra... (Appuyez sur ECHAP pour quitter)" if not args.replay else f"[✅] Replay vidéo: {args.replay}")
 cap = cv2.VideoCapture(input_source)
 if not args.replay:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(config["camera"]["width"]))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(config["camera"]["height"]))
 
 profiler = RunProfiler(output_path=metrics_path)
 frame_idx = 0
@@ -205,7 +197,7 @@ while cap.isOpened():
 
         if pose_text == "FACE":
             asym_score = calculate_global_asymmetry(landmarks, img_w, img_h)
-            if asym_score > 20:
+            if asym_score > float(config["asymmetry"]["threshold"]):
                 is_asymmetric = True
                 threat_score += 40
 
@@ -239,9 +231,9 @@ while cap.isOpened():
             activation = averaged_preds[top_2_idx[0]] * 100
 
             if dom_emo in ['ANGRY', 'CONTEMPT']:
-                threat_score += 60
+                threat_score += int(config["threat"]["angry_contempt_bonus"])
             if dom_emo in ['FEAR']:
-                threat_score += 30
+                threat_score += int(config["threat"]["fear_bonus"])
 
     with Timer(frame_timings.timings_ms, "ui"):
         if not args.no_ui and res.face_landmarks:
@@ -299,7 +291,7 @@ while cap.isOpened():
             cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w//2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
         if not args.no_ui:
-            cv2.imshow('FaceGuard V2.0 - Edition Industrielle', frame_vis)
+            cv2.imshow(config["ui"]["window_name"], frame_vis)
             should_quit = (cv2.waitKey(5) & 0xFF == 27)
         else:
             should_quit = False
