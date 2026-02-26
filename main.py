@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--ui", choices=UI_MODES, default=None, help="UI rendering mode override: full|min|off")
     parser.add_argument("--outdir", type=str, default=None, help="Output directory for runs")
     parser.add_argument("--record-overlay", action="store_true", help="Record annotated frames instead of raw frames")
+    parser.add_argument("--max-seconds", type=float, default=None, help="Maximum runtime duration in seconds")
     return parser.parse_args()
 
 
@@ -152,6 +153,9 @@ def draw_transparent_box(image, x, y, w, h, alpha=0.6):
 
 
 input_source = args.replay if args.replay else int(config["camera"]["index"])
+max_seconds = args.max_seconds if args.max_seconds is not None else config["runtime"].get("max_seconds")
+max_seconds = float(max_seconds) if max_seconds is not None else None
+
 print("[✅] Démarrage de la caméra... (Appuyez sur ECHAP pour quitter)" if not args.replay else f"[✅] Replay vidéo: {args.replay}")
 cap = cv2.VideoCapture(input_source)
 if not args.replay:
@@ -161,187 +165,199 @@ if not args.replay:
 profiler = RunProfiler(output_path=metrics_path)
 frame_idx = 0
 writer = None
+run_start = time.perf_counter()
+interrupted = False
 
-while cap.isOpened():
-    frame_start = time.perf_counter()
-    frame_ts_ms = int(time.time() * 1000)
-    frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
-    frame_idx += 1
+try:
+    while cap.isOpened():
+        if max_seconds is not None and (time.perf_counter() - run_start) >= max_seconds:
+            print(f"[ℹ️] Durée max atteinte ({max_seconds:.2f}s). Arrêt propre.")
+            break
 
-    with Timer(frame_timings.timings_ms, "capture"):
-        success, frame_raw = cap.read()
-        if success and not args.replay:
-            frame_raw = cv2.flip(frame_raw, 1)
+        frame_start = time.perf_counter()
+        frame_ts_ms = int(time.time() * 1000)
+        frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
+        frame_idx += 1
 
-    if not success:
-        break
+        with Timer(frame_timings.timings_ms, "capture"):
+            success, frame_raw = cap.read()
+            if success and not args.replay:
+                frame_raw = cv2.flip(frame_raw, 1)
 
-    frame_vis = frame_raw.copy()
-    img_h, img_w, _ = frame_raw.shape
+        if not success:
+            break
 
-    if args.record and writer is None:
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0:
-            fps = 30.0
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
+        frame_vis = frame_raw.copy()
+        img_h, img_w, _ = frame_raw.shape
 
-    with Timer(frame_timings.timings_ms, "mediapipe"):
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB))
-        res = detector.detect(mp_image)
+        if args.record and writer is None:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if not fps or fps <= 0:
+                fps = 30.0
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
 
-    threat_score = 0
-    dom_emo = "SCANNING..."
-    activation = 0.0
-    pose_text = "INCONNU"
-    valid_quality = False
-    is_asymmetric = False
-    x_min = y_min = x_max = y_max = None
+        with Timer(frame_timings.timings_ms, "mediapipe"):
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB))
+            res = detector.detect(mp_image)
 
-    frame_timings.has_face = bool(res.face_landmarks)
+        threat_score = 0
+        dom_emo = "SCANNING..."
+        activation = 0.0
+        pose_text = "INCONNU"
+        valid_quality = False
+        is_asymmetric = False
+        x_min = y_min = x_max = y_max = None
 
-    if res.face_landmarks:
-        landmarks = res.face_landmarks[0]
+        frame_timings.has_face = bool(res.face_landmarks)
 
-        pose_text = get_head_pose(landmarks)
+        if res.face_landmarks:
+            landmarks = res.face_landmarks[0]
 
-        if pose_text == "FACE":
-            asym_score = calculate_global_asymmetry(landmarks, img_w, img_h)
-            if asym_score > float(config["asymmetry"]["threshold"]):
-                is_asymmetric = True
-                threat_score += 40
+            pose_text = get_head_pose(landmarks)
 
-        x_vals = [l.x for l in landmarks]
-        y_vals = [l.y for l in landmarks]
-        x_min, x_max = max(0, int(min(x_vals) * img_w) - 10), min(img_w, int(max(x_vals) * img_w) + 10)
-        y_min, y_max = max(0, int(min(y_vals) * img_h) - 20), min(img_h, int(max(y_vals) * img_h) + 10)
+            if pose_text == "FACE":
+                asym_score = calculate_global_asymmetry(landmarks, img_w, img_h)
+                if asym_score > float(config["asymmetry"]["threshold"]):
+                    is_asymmetric = True
+                    threat_score += 40
 
-        averaged_preds = np.zeros(len(EMOTION_CLASSES))
+            x_vals = [l.x for l in landmarks]
+            y_vals = [l.y for l in landmarks]
+            x_min, x_max = max(0, int(min(x_vals) * img_w) - 10), min(img_w, int(max(x_vals) * img_w) + 10)
+            y_min, y_max = max(0, int(min(y_vals) * img_h) - 20), min(img_h, int(max(y_vals) * img_h) + 10)
 
-        if (x_max - x_min) > 40:
-            with Timer(frame_timings.timings_ms, "preprocess"):
-                face_crop = frame_raw[y_min:y_max, x_min:x_max]
-                gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                clahe_img = clahe.apply(gray)
-                final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
+            averaged_preds = np.zeros(len(EMOTION_CLASSES))
 
-                ai_input = cv2.resize(final_input, (48, 48))
-                tensor = np.expand_dims(ai_input, axis=0)
+            if (x_max - x_min) > 40:
+                with Timer(frame_timings.timings_ms, "preprocess"):
+                    face_crop = frame_raw[y_min:y_max, x_min:x_max]
+                    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                    clahe_img = clahe.apply(gray)
+                    final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
 
-            with Timer(frame_timings.timings_ms, "infer"):
-                raw_preds = emotion_model(tensor, training=False)[0].numpy()
-                preds_buffer.append(raw_preds)
-                averaged_preds = np.mean(preds_buffer, axis=0)
+                    ai_input = cv2.resize(final_input, (48, 48))
+                    tensor = np.expand_dims(ai_input, axis=0)
 
-            valid_quality = True
+                with Timer(frame_timings.timings_ms, "infer"):
+                    raw_preds = emotion_model(tensor, training=False)[0].numpy()
+                    preds_buffer.append(raw_preds)
+                    averaged_preds = np.mean(preds_buffer, axis=0)
 
-        if len(preds_buffer) > 0:
-            top_2_idx = averaged_preds.argsort()[-2:][::-1]
-            dom_emo = EMOTION_CLASSES[top_2_idx[0]]
-            activation = averaged_preds[top_2_idx[0]] * 100
+                valid_quality = True
 
-            if dom_emo in ['ANGRY', 'CONTEMPT']:
-                threat_score += int(config["threat"]["angry_contempt_bonus"])
-            if dom_emo in ['FEAR']:
-                threat_score += int(config["threat"]["fear_bonus"])
+            if len(preds_buffer) > 0:
+                top_2_idx = averaged_preds.argsort()[-2:][::-1]
+                dom_emo = EMOTION_CLASSES[top_2_idx[0]]
+                activation = averaged_preds[top_2_idx[0]] * 100
 
-    with Timer(frame_timings.timings_ms, "ui"):
-        if ui_mode == "full":
-            if res.face_landmarks:
-                landmarks = res.face_landmarks[0]
+                if dom_emo in ['ANGRY', 'CONTEMPT']:
+                    threat_score += int(config["threat"]["angry_contempt_bonus"])
+                if dom_emo in ['FEAR']:
+                    threat_score += int(config["threat"]["fear_bonus"])
 
-                mp_draw_landmarks(
-                    image=frame_vis,
-                    landmark_list=landmarks,
-                    connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=MpDrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0)
-                )
+        with Timer(frame_timings.timings_ms, "ui"):
+            if ui_mode == "full":
+                if res.face_landmarks:
+                    landmarks = res.face_landmarks[0]
 
-                if len(preds_buffer) > 0:
-                    forehead_x, forehead_y = int(landmarks[10].x * img_w), int(landmarks[10].y * img_h)
-                    box_right_x = min(x_max + 30, img_w - 200)
-                    box_right_y = max(30, y_min - 20)
-                    cv2.line(frame_vis, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
+                    mp_draw_landmarks(
+                        image=frame_vis,
+                        landmark_list=landmarks,
+                        connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=MpDrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0)
+                    )
 
-                    display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
-                    frame_vis = draw_transparent_box(frame_vis, box_right_x, box_right_y, 200, 180, alpha=0.5)
+                    if len(preds_buffer) > 0:
+                        forehead_x, forehead_y = int(landmarks[10].x * img_w), int(landmarks[10].y * img_h)
+                        box_right_x = min(x_max + 30, img_w - 200)
+                        box_right_y = max(30, y_min - 20)
+                        cv2.line(frame_vis, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
 
-                    y_offset = box_right_y + 20
-                    for emo in display_order:
-                        idx = EMOTION_CLASSES.index(emo)
-                        score = averaged_preds[idx] * 100
-                        thickness = 2 if emo == dom_emo else 1
-                        color = (255, 255, 255) if emo == dom_emo else (180, 180, 180)
-                        cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
-                        y_offset += 20
+                        display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
+                        frame_vis = draw_transparent_box(frame_vis, box_right_x, box_right_y, 200, 180, alpha=0.5)
 
-                    box_left_x = max(10, x_min - 220)
-                    box_left_y = max(30, y_min + 50)
+                        y_offset = box_right_y + 20
+                        for emo in display_order:
+                            idx = EMOTION_CLASSES.index(emo)
+                            score = averaged_preds[idx] * 100
+                            thickness = 2 if emo == dom_emo else 1
+                            color = (255, 255, 255) if emo == dom_emo else (180, 180, 180)
+                            cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
+                            y_offset += 20
 
-                    ts_color = (0, 255, 0)
-                    if threat_score >= 40:
-                        ts_color = (0, 165, 255)
-                    if threat_score >= 70:
-                        ts_color = (0, 0, 255)
+                        box_left_x = max(10, x_min - 220)
+                        box_left_y = max(30, y_min + 50)
 
-                    frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
-                    cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
+                        ts_color = (0, 255, 0)
+                        if threat_score >= 40:
+                            ts_color = (0, 165, 255)
+                        if threat_score >= 70:
+                            ts_color = (0, 0, 255)
 
-                    cv2.putText(frame_vis, f"{dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.putText(frame_vis, f"THREAT SCORE: {threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
+                        frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
+                        cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
 
-                    if is_asymmetric:
-                        cv2.putText(frame_vis, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                        cv2.putText(frame_vis, f"{dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.putText(frame_vis, f"THREAT SCORE: {threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
 
-                    cheek_x, cheek_y = int(landmarks[234].x * img_w), int(landmarks[234].y * img_h)
-                    cv2.line(frame_vis, (box_left_x + 200, box_left_y + 50), (cheek_x, cheek_y), (255, 255, 255), 1)
+                        if is_asymmetric:
+                            cv2.putText(frame_vis, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
-            if threat_score >= 70:
-                cv2.rectangle(frame_vis, (0, 0), (img_w, img_h), (0, 0, 255), 4)
-                cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w//2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                        cheek_x, cheek_y = int(landmarks[234].x * img_w), int(landmarks[234].y * img_h)
+                        cv2.line(frame_vis, (box_left_x + 200, box_left_y + 50), (cheek_x, cheek_y), (255, 255, 255), 1)
 
-            cv2.imshow(config["ui"]["window_name"], frame_vis)
-            should_quit = (cv2.waitKey(5) & 0xFF == 27)
+                if threat_score >= 70:
+                    cv2.rectangle(frame_vis, (0, 0), (img_w, img_h), (0, 0, 255), 4)
+                    cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w//2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-        elif ui_mode == "min":
-            if res.face_landmarks and x_min is not None:
-                cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"EMO: {dom_emo}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"THREAT: {threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"POSE: {pose_text}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"INFER_OK: {valid_quality}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.imshow(config["ui"]["window_name"], frame_vis)
+                should_quit = (cv2.waitKey(5) & 0xFF == 27)
 
-            cv2.imshow(config["ui"]["window_name"], frame_vis)
-            should_quit = (cv2.waitKey(5) & 0xFF == 27)
+            elif ui_mode == "min":
+                if res.face_landmarks and x_min is not None:
+                    cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
+                    cv2.putText(frame_vis, f"EMO: {dom_emo}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(frame_vis, f"THREAT: {threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(frame_vis, f"POSE: {pose_text}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(frame_vis, f"INFER_OK: {valid_quality}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        else:  # off
-            should_quit = False
+                cv2.imshow(config["ui"]["window_name"], frame_vis)
+                should_quit = (cv2.waitKey(5) & 0xFF == 27)
 
+            else:  # off
+                should_quit = False
+
+        if writer is not None:
+            writer.write(frame_vis if args.record_overlay else frame_raw)
+
+        frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
+        frame_timings.pose = pose_text
+        frame_timings.valid_quality = valid_quality
+        frame_timings.emotion_top1 = dom_emo
+        frame_timings.emotion_p = float(activation / 100.0)
+        frame_timings.threat_score = int(threat_score)
+        profiler.write_frame(frame_timings)
+
+        if should_quit:
+            break
+except KeyboardInterrupt:
+    interrupted = True
+    print("\n[ℹ️] Interruption clavier reçue (CTRL-C). Arrêt propre en cours...")
+finally:
+    cap.release()
     if writer is not None:
-        writer.write(frame_vis if args.record_overlay else frame_raw)
-
-    frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
-    frame_timings.pose = pose_text
-    frame_timings.valid_quality = valid_quality
-    frame_timings.emotion_top1 = dom_emo
-    frame_timings.emotion_p = float(activation / 100.0)
-    frame_timings.threat_score = int(threat_score)
-    profiler.write_frame(frame_timings)
-
-    if should_quit:
-        break
-
-cap.release()
-if writer is not None:
-    writer.release()
-if ui_mode != "off":
-    cv2.destroyAllWindows()
-profiler.print_summary()
-profiler.close()
+        writer.release()
+    if ui_mode != "off":
+        cv2.destroyAllWindows()
+    profiler.print_summary()
+    profiler.close()
 
 print(f"[✅] Run ID: {run_id}")
 print(f"[✅] Metrics: {metrics_path}")
 if writer is not None:
     mode = "overlay" if args.record_overlay else "raw"
     print(f"[✅] Video: {video_path} ({mode})")
+if interrupted:
+    print("[✅] Run interrompu proprement.")

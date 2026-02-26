@@ -55,6 +55,11 @@ python main.py --ui min
 python main.py --ui off
 ```
 
+- Run benchmark headless avec durée max:
+```bash
+python main.py --ui off --max-seconds 30
+```
+
 ## Record / Replay
 - Enregistrer une session:
 ```bash

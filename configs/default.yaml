@@ -36,5 +36,6 @@ ui:
 
 runtime:
   outdir: runs
+  max_seconds: null
   metrics_filename: metrics.jsonl
   video_filename: video.mp4
