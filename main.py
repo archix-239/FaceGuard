@@ -9,6 +9,9 @@ import numpy as np
 from collections import deque
 import math
 import os
+import time
+
+from faceguard.profiling import Timer, FrameTimings, RunProfiler
 
 print("\n" + "="*50)
 print("🚀 DÉMARRAGE DE FACEGUARD V2.0 (SYSTÈME COMPLET) 🚀")
@@ -111,32 +114,41 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
+profiler = RunProfiler(logs_dir='logs')
+frame_idx = 0
+
 while cap.isOpened():
-    success, image = cap.read()
+    frame_start = time.perf_counter()
+    frame_ts_ms = int(time.time() * 1000)
+    frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
+    frame_idx += 1
+
+    with Timer(frame_timings.timings_ms, "capture"):
+        success, image = cap.read()
+        if success:
+            image = cv2.flip(image, 1)
+
     if not success: break
-    image = cv2.flip(image, 1)
+
     img_h, img_w, _ = image.shape
-    
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    res = detector.detect(mp_image)
+
+    with Timer(frame_timings.timings_ms, "mediapipe"):
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        res = detector.detect(mp_image)
 
     threat_score = 0
     dom_emo = "SCANNING..."
     sec_emo = "..."
     activation = 0.0
+    pose_text = "INCONNU"
+    valid_quality = False
+    is_asymmetric = False
+
+    frame_timings.has_face = bool(res.face_landmarks)
 
     if res.face_landmarks:
         landmarks = res.face_landmarks[0]
         
-        # --- A. DESSIN DU WIREFRAME ---
-        mp_draw_landmarks(
-            image=image,
-            landmark_list=landmarks,
-            connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=MpDrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0)
-        )
-
         # --- B. GÉOMÉTRIE & ASYMÉTRIE ---
         pose_text = get_head_pose(landmarks)
         is_asymmetric = False
@@ -155,19 +167,23 @@ while cap.isOpened():
         averaged_preds = np.zeros(len(EMOTION_CLASSES))
         
         if (x_max - x_min) > 40:
-            # CLAHE
-            face_crop = image[y_min:y_max, x_min:x_max]
-            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-            clahe_img = clahe.apply(gray)
-            final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
+            with Timer(frame_timings.timings_ms, "preprocess"):
+                # CLAHE
+                face_crop = image[y_min:y_max, x_min:x_max]
+                gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                clahe_img = clahe.apply(gray)
+                final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
 
-            # IA (Résolution ConvNeXt : 224x224)
-            ai_input = cv2.resize(final_input, (48, 48))
-            tensor = np.expand_dims(ai_input, axis=0)
-            
-            raw_preds = emotion_model(tensor, training=False)[0].numpy()
-            preds_buffer.append(raw_preds)
-            averaged_preds = np.mean(preds_buffer, axis=0)
+                # IA (Résolution ConvNeXt : 224x224)
+                ai_input = cv2.resize(final_input, (48, 48))
+                tensor = np.expand_dims(ai_input, axis=0)
+
+            with Timer(frame_timings.timings_ms, "infer"):
+                raw_preds = emotion_model(tensor, training=False)[0].numpy()
+                preds_buffer.append(raw_preds)
+                averaged_preds = np.mean(preds_buffer, axis=0)
+
+            valid_quality = True
 
         # --- D. LOGIQUE DE MENACE (THREAT ENGINE) ---
         if len(preds_buffer) > 0:
@@ -180,55 +196,81 @@ while cap.isOpened():
             if dom_emo in ['ANGRY', 'CONTEMPT']: threat_score += 60
             if dom_emo in ['FEAR']: threat_score += 30
 
-        # --- E. RENDU YOUTUBE LOOK ---
-        if len(preds_buffer) > 0:
-            # Ligne et Boîte Droite
-            forehead_x, forehead_y = int(landmarks[10].x * img_w), int(landmarks[10].y * img_h)
-            box_right_x = min(x_max + 30, img_w - 200)
-            box_right_y = max(30, y_min - 20)
-            cv2.line(image, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
+    with Timer(frame_timings.timings_ms, "ui"):
+        if res.face_landmarks:
+            landmarks = res.face_landmarks[0]
 
-            display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
-            image = draw_transparent_box(image, box_right_x, box_right_y, 200, 180, alpha=0.5)
-            
-            y_offset = box_right_y + 20
-            for emo in display_order:
-                idx = EMOTION_CLASSES.index(emo)
-                score = averaged_preds[idx] * 100
-                thickness = 2 if emo == dom_emo else 1
-                color = (255, 255, 255) if emo == dom_emo else (180, 180, 180)
-                cv2.putText(image, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
-                y_offset += 20
+            # --- A. DESSIN DU WIREFRAME ---
+            mp_draw_landmarks(
+                image=image,
+                landmark_list=landmarks,
+                connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=MpDrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0)
+            )
 
-            # Boîte Gauche (Score de Menace)
-            box_left_x = max(10, x_min - 220)
-            box_left_y = max(30, y_min + 50)
-            
-            # Couleur du Threat Score
-            ts_color = (0, 255, 0)
-            if threat_score >= 40: ts_color = (0, 165, 255)
-            if threat_score >= 70: ts_color = (0, 0, 255)
+            # --- E. RENDU YOUTUBE LOOK ---
+            if len(preds_buffer) > 0:
+                # Ligne et Boîte Droite
+                forehead_x, forehead_y = int(landmarks[10].x * img_w), int(landmarks[10].y * img_h)
+                box_right_x = min(x_max + 30, img_w - 200)
+                box_right_y = max(30, y_min - 20)
+                cv2.line(image, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
 
-            image = draw_transparent_box(image, box_left_x, box_left_y, 200, 110, alpha=0.6)
-            cv2.line(image, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
-            
-            cv2.putText(image, f"{dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(image, f"THREAT SCORE: {threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
-            
-            if is_asymmetric:
-                cv2.putText(image, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
+                image = draw_transparent_box(image, box_right_x, box_right_y, 200, 180, alpha=0.5)
 
-            # Ligne Gauche
-            cheek_x, cheek_y = int(landmarks[234].x * img_w), int(landmarks[234].y * img_h)
-            cv2.line(image, (box_left_x + 200, box_left_y + 50), (cheek_x, cheek_y), (255, 255, 255), 1)
+                y_offset = box_right_y + 20
+                for emo in display_order:
+                    idx = EMOTION_CLASSES.index(emo)
+                    score = averaged_preds[idx] * 100
+                    thickness = 2 if emo == dom_emo else 1
+                    color = (255, 255, 255) if emo == dom_emo else (180, 180, 180)
+                    cv2.putText(image, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
+                    y_offset += 20
 
-    # --- ALERTE GLOBALE (Effet de clignotement Rouge sur l'écran) ---
-    if threat_score >= 70:
-        cv2.rectangle(image, (0, 0), (img_w, img_h), (0, 0, 255), 4) # Bordure rouge
-        cv2.putText(image, "INTENTION HOSTILE DETECTEE", (img_w//2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                # Boîte Gauche (Score de Menace)
+                box_left_x = max(10, x_min - 220)
+                box_left_y = max(30, y_min + 50)
 
-    cv2.imshow('FaceGuard V2.0 - Edition Industrielle', image)
-    if cv2.waitKey(5) & 0xFF == 27: break
+                # Couleur du Threat Score
+                ts_color = (0, 255, 0)
+                if threat_score >= 40: ts_color = (0, 165, 255)
+                if threat_score >= 70: ts_color = (0, 0, 255)
+
+                image = draw_transparent_box(image, box_left_x, box_left_y, 200, 110, alpha=0.6)
+                cv2.line(image, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
+
+                cv2.putText(image, f"{dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(image, f"THREAT SCORE: {threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
+
+                if is_asymmetric:
+                    cv2.putText(image, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+
+                # Ligne Gauche
+                cheek_x, cheek_y = int(landmarks[234].x * img_w), int(landmarks[234].y * img_h)
+                cv2.line(image, (box_left_x + 200, box_left_y + 50), (cheek_x, cheek_y), (255, 255, 255), 1)
+
+        # --- ALERTE GLOBALE (Effet de clignotement Rouge sur l'écran) ---
+        if threat_score >= 70:
+            cv2.rectangle(image, (0, 0), (img_w, img_h), (0, 0, 255), 4) # Bordure rouge
+            cv2.putText(image, "INTENTION HOSTILE DETECTEE", (img_w//2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+        cv2.imshow('FaceGuard V2.0 - Edition Industrielle', image)
+        should_quit = (cv2.waitKey(5) & 0xFF == 27)
+
+    frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
+    frame_timings.pose = pose_text
+    frame_timings.valid_quality = valid_quality
+    frame_timings.emotion_top1 = dom_emo
+    frame_timings.emotion_p = float(activation / 100.0)
+    frame_timings.threat_score = int(threat_score)
+    profiler.write_frame(frame_timings)
+
+    if should_quit:
+        break
 
 cap.release()
 cv2.destroyAllWindows()
+profiler.print_summary()
+profiler.close()
