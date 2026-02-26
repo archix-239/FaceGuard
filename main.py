@@ -290,15 +290,17 @@ try:
                 x_max = max(0, min(img_w, int(x_max_w * scale_x)))
                 y_min = max(0, min(img_h, int(y_min_w * scale_y)))
                 y_max = max(0, min(img_h, int(y_max_w * scale_y)))
-                tracked_bbox = (x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min))
+                bx, by, bw, bh = clip_bbox_xywh(x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h)
+                tracked_bbox = (int(bx), int(by), int(bw), int(bh))
 
                 if TRACKING_ENABLED:
                     tracker = create_tracker(TRACKER_TYPE)
                     if tracker is not None:
-                        track_ok = tracker.init(frame_raw, tuple(float(v) for v in tracked_bbox))
+                        track_ok = tracker.init(frame_raw, tuple(int(v) for v in tracked_bbox))
                     else:
                         track_ok = False
                 else:
+                    tracker = None
                     track_ok = True
                 missed_frames = 0
             else:
@@ -308,7 +310,7 @@ try:
                     tracked_bbox = None
                 track_ok = False
         else:
-            if tracker is not None and tracked_bbox is not None:
+            if TRACKING_ENABLED and tracker is not None and tracked_bbox is not None:
                 ok, bbox = tracker.update(frame_raw)
                 if ok:
                     x, y, w, h = clip_bbox_xywh(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), img_w, img_h)
