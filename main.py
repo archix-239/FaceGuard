@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("--replay", type=str, default=None, help="Replay from an existing video file")
     parser.add_argument("--no-ui", action="store_true", help="Disable OpenCV window rendering")
     parser.add_argument("--outdir", type=str, default="runs", help="Output directory for runs")
+    parser.add_argument("--record-overlay", action="store_true", help="Record annotated frames instead of raw frames")
     return parser.parse_args()
 
 
@@ -167,14 +168,15 @@ while cap.isOpened():
     frame_idx += 1
 
     with Timer(frame_timings.timings_ms, "capture"):
-        success, image = cap.read()
+        success, frame_raw = cap.read()
         if success and not args.replay:
-            image = cv2.flip(image, 1)
+            frame_raw = cv2.flip(frame_raw, 1)
 
     if not success:
         break
 
-    img_h, img_w, _ = image.shape
+    frame_vis = frame_raw.copy()
+    img_h, img_w, _ = frame_raw.shape
 
     if args.record and writer is None:
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -184,7 +186,7 @@ while cap.isOpened():
         writer = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
 
     with Timer(frame_timings.timings_ms, "mediapipe"):
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB))
         res = detector.detect(mp_image)
 
     threat_score = 0
@@ -216,7 +218,7 @@ while cap.isOpened():
 
         if (x_max - x_min) > 40:
             with Timer(frame_timings.timings_ms, "preprocess"):
-                face_crop = image[y_min:y_max, x_min:x_max]
+                face_crop = frame_raw[y_min:y_max, x_min:x_max]
                 gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
                 clahe_img = clahe.apply(gray)
                 final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
@@ -246,7 +248,7 @@ while cap.isOpened():
             landmarks = res.face_landmarks[0]
 
             mp_draw_landmarks(
-                image=image,
+                image=frame_vis,
                 landmark_list=landmarks,
                 connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
                 landmark_drawing_spec=None,
@@ -257,10 +259,10 @@ while cap.isOpened():
                 forehead_x, forehead_y = int(landmarks[10].x * img_w), int(landmarks[10].y * img_h)
                 box_right_x = min(x_max + 30, img_w - 200)
                 box_right_y = max(30, y_min - 20)
-                cv2.line(image, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
+                cv2.line(frame_vis, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
 
                 display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
-                image = draw_transparent_box(image, box_right_x, box_right_y, 200, 180, alpha=0.5)
+                frame_vis = draw_transparent_box(frame_vis, box_right_x, box_right_y, 200, 180, alpha=0.5)
 
                 y_offset = box_right_y + 20
                 for emo in display_order:
@@ -268,7 +270,7 @@ while cap.isOpened():
                     score = averaged_preds[idx] * 100
                     thickness = 2 if emo == dom_emo else 1
                     color = (255, 255, 255) if emo == dom_emo else (180, 180, 180)
-                    cv2.putText(image, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
+                    cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
                     y_offset += 20
 
                 box_left_x = max(10, x_min - 220)
@@ -280,30 +282,30 @@ while cap.isOpened():
                 if threat_score >= 70:
                     ts_color = (0, 0, 255)
 
-                image = draw_transparent_box(image, box_left_x, box_left_y, 200, 110, alpha=0.6)
-                cv2.line(image, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
+                frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
+                cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
 
-                cv2.putText(image, f"{dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(image, f"THREAT SCORE: {threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
+                cv2.putText(frame_vis, f"{dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame_vis, f"THREAT SCORE: {threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
 
                 if is_asymmetric:
-                    cv2.putText(image, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                    cv2.putText(frame_vis, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
                 cheek_x, cheek_y = int(landmarks[234].x * img_w), int(landmarks[234].y * img_h)
-                cv2.line(image, (box_left_x + 200, box_left_y + 50), (cheek_x, cheek_y), (255, 255, 255), 1)
+                cv2.line(frame_vis, (box_left_x + 200, box_left_y + 50), (cheek_x, cheek_y), (255, 255, 255), 1)
 
         if not args.no_ui and threat_score >= 70:
-            cv2.rectangle(image, (0, 0), (img_w, img_h), (0, 0, 255), 4)
-            cv2.putText(image, "INTENTION HOSTILE DETECTEE", (img_w//2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+            cv2.rectangle(frame_vis, (0, 0), (img_w, img_h), (0, 0, 255), 4)
+            cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w//2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
         if not args.no_ui:
-            cv2.imshow('FaceGuard V2.0 - Edition Industrielle', image)
+            cv2.imshow('FaceGuard V2.0 - Edition Industrielle', frame_vis)
             should_quit = (cv2.waitKey(5) & 0xFF == 27)
         else:
             should_quit = False
 
     if writer is not None:
-        writer.write(image)
+        writer.write(frame_vis if args.record_overlay else frame_raw)
 
     frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
     frame_timings.pose = pose_text
@@ -327,4 +329,5 @@ profiler.close()
 print(f"[✅] Run ID: {run_id}")
 print(f"[✅] Metrics: {metrics_path}")
 if writer is not None:
-    print(f"[✅] Video: {video_path}")
+    mode = "overlay" if args.record_overlay else "raw"
+    print(f"[✅] Video: {video_path} ({mode})")
