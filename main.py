@@ -174,6 +174,7 @@ frame_idx = 0
 writer = None
 run_start = time.perf_counter()
 interrupted = False
+infer_count = 0
 
 try:
     while cap.isOpened():
@@ -277,6 +278,7 @@ try:
                         last_prediction = np.mean(preds_buffer, axis=0)
 
                     infer_ran = True
+                    infer_count += 1
                     if INFER_INTERVAL_MS == 0.0:
                         next_infer_ts_ms = clock_ts_ms
                     else:
@@ -396,6 +398,9 @@ finally:
     profiler.print_summary()
     profiler.close()
 
+run_duration_sec = max(time.perf_counter() - run_start, 1e-9)
+effective_infer_fps = infer_count / run_duration_sec
+
 print(f"[✅] Run ID: {run_id}")
 print(f"[✅] Metrics: {metrics_path}")
 if writer is not None:
@@ -403,3 +408,6 @@ if writer is not None:
     print(f"[✅] Video: {video_path} ({mode})")
 if interrupted:
     print("[✅] Run interrompu proprement.")
+print(f"[✅] infer_count: {infer_count}")
+print(f"[✅] duration_sec: {run_duration_sec:.2f}")
+print(f"[✅] effective_infer_fps: {effective_infer_fps:.2f}")
