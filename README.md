@@ -46,6 +46,15 @@ camera:
 python main.py --config configs/custom.yaml
 ```
 
+- Mode UI minimal (sans tesselation):
+```bash
+python main.py --ui min
+```
+- Mode UI off (pas de fenêtre, logs/profiling actifs):
+```bash
+python main.py --ui off
+```
+
 ## Record / Replay
 - Enregistrer une session:
 ```bash
