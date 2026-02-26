@@ -5,7 +5,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 class Timer:
@@ -54,10 +54,20 @@ class FrameTimings:
 
 
 class RunProfiler:
-    def __init__(self, logs_dir: str = "logs", flush_every_n: int = 30):
-        os.makedirs(logs_dir, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        self.path = os.path.join(logs_dir, f"run_{ts}.jsonl")
+    def __init__(
+        self,
+        logs_dir: str = "logs",
+        flush_every_n: int = 30,
+        output_path: Optional[str] = None,
+    ):
+        if output_path is not None:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            self.path = output_path
+        else:
+            os.makedirs(logs_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self.path = os.path.join(logs_dir, f"run_{ts}.jsonl")
+
         self._fh = open(self.path, "w", encoding="utf-8")
         self._flush_every_n = max(1, flush_every_n)
         self._write_count = 0
