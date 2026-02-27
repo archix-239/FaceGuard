@@ -54,7 +54,17 @@ work_frame:
 
 tracking:
   enabled: true
+  max_faces: 4
   detect_every_ms: 400
   detect_every_n_frames: 15
   tracker_type: MOSSE
   max_missed_frames: 30
+  ttl_ms: 3000
+  dedup_iou_threshold: 0.5
+  match:
+    iou_min: 0.15
+    dist_max_norm: 0.4
+    size_penalty_weight: 0.3
+  reacquire:
+    grace_ms: 1500
+    multiplier: 1.5

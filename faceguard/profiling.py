@@ -44,6 +44,18 @@ class FrameTimings:
     emotion_top1: str = "SCANNING..."
     emotion_p: float = 0.0
     threat_score: int = 0
+    # Multi-person diagnostics
+    people: Optional[List[dict]] = None
+    raw_dets: int = 0
+    kept_dets: int = 0
+    active_persons: int = 0
+    match_events: Optional[List[dict]] = None
+    new_ids_created: Optional[List[dict]] = None
+    expired_ids: Optional[List[int]] = None
+    unmatched_dets: int = 0
+    skipped_frames: int = 0
+    queue_depth: int = 0
+    dt_ms: float = 0.0
 
     def to_json_line(self) -> str:
         payload = {
@@ -63,6 +75,17 @@ class FrameTimings:
             "emotion_top1": self.emotion_top1,
             "emotion_p": self.emotion_p,
             "threat_score": self.threat_score,
+            "people": self.people,
+            "raw_dets": self.raw_dets,
+            "kept_dets": self.kept_dets,
+            "active_persons": self.active_persons,
+            "match_events": self.match_events,
+            "new_ids_created": self.new_ids_created,
+            "expired_ids": self.expired_ids,
+            "unmatched_dets": self.unmatched_dets,
+            "skipped_frames": self.skipped_frames,
+            "queue_depth": self.queue_depth,
+            "dt_ms": round(self.dt_ms, 2),
         }
         return json.dumps(payload, ensure_ascii=False)
 

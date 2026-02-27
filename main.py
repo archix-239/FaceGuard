@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from faceguard.config import load_config
 from faceguard.profiling import Timer, FrameTimings, RunProfiler
 from faceguard.services.inference_backend import create_inference_backend
+from faceguard.tracking import MultiPersonTracker, bbox_center, bbox_iou
 
 
 UI_MODES = ("full", "min", "off")
@@ -134,8 +135,20 @@ def draw_transparent_box(image, x, y, w, h, alpha=0.6):
 
 
 @dataclass
+class PersonOverlay:
+    person_id: int
+    bbox: tuple[int, int, int, int]  # (x_min, y_min, x_max, y_max) for render
+    dom_emo: str = "SCANNING..."
+    threat_score: int = 0
+    pose_text: str = "INCONNU"
+    last_prediction: np.ndarray = field(default_factory=lambda: np.zeros(8, dtype=np.float32))
+    is_asymmetric: bool = False
+
+
+@dataclass
 class OverlayState:
     frame_idx: int = -1
+    people: list[PersonOverlay] = field(default_factory=list)
     has_face: bool = False
     bbox: tuple[int, int, int, int] | None = None
     dom_emo: str = "SCANNING..."
@@ -164,8 +177,21 @@ class SharedState:
 
     def get_overlay(self) -> OverlayState:
         with self._lock:
+            people_copy = [
+                PersonOverlay(
+                    person_id=p.person_id,
+                    bbox=p.bbox,
+                    dom_emo=p.dom_emo,
+                    threat_score=p.threat_score,
+                    pose_text=p.pose_text,
+                    last_prediction=np.array(p.last_prediction, copy=True),
+                    is_asymmetric=p.is_asymmetric,
+                )
+                for p in self.overlay.people
+            ]
             return OverlayState(
                 frame_idx=self.overlay.frame_idx,
+                people=people_copy,
                 has_face=self.overlay.has_face,
                 bbox=self.overlay.bbox,
                 dom_emo=self.overlay.dom_emo,
@@ -242,6 +268,7 @@ INFER_WARMUP_RUNS = int(inference_cfg.get("warmup_runs", 0))
 
 TRACKING_ENABLED = bool(config.get("tracking", {}).get("enabled", True))
 tracking_cfg = config.get("tracking", {})
+MAX_FACES = max(1, int(tracking_cfg.get("max_faces", 4)))
 detect_every_ms_raw = tracking_cfg.get("detect_every_ms")
 DETECT_EVERY_MS = float(detect_every_ms_raw) if detect_every_ms_raw is not None else None
 if DETECT_EVERY_MS is not None and DETECT_EVERY_MS <= 0:
@@ -249,6 +276,10 @@ if DETECT_EVERY_MS is not None and DETECT_EVERY_MS <= 0:
 DETECT_EVERY_N_FRAMES = max(1, int(tracking_cfg.get("detect_every_n_frames", 15)))
 TRACKER_TYPE = str(tracking_cfg.get("tracker_type", "MOSSE"))
 MAX_MISSED_FRAMES = max(0, int(tracking_cfg.get("max_missed_frames", 30)))
+MATCH_CFG = tracking_cfg.get("match", {})
+REACQUIRE_CFG = tracking_cfg.get("reacquire", {})
+TTL_MS = int(tracking_cfg.get("ttl_ms", 3000))
+DEDUP_IOU_THRESHOLD = float(tracking_cfg.get("dedup_iou_threshold", 0.5))
 
 print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
 try:
@@ -272,9 +303,9 @@ if INFER_WARMUP_RUNS > 0:
     print(f"[⏳] Warmup backend inférence ({INFER_WARMUP_RUNS} runs)...")
     inference_engine.warmup(input_shape=(1, 48, 48, 3), runs=INFER_WARMUP_RUNS)
 
-print("[⏳] Initialisation des capteurs géométriques...")
+print(f"[⏳] Initialisation des capteurs géométriques (max_faces={MAX_FACES})...")
 base_options = python.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH)
-options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
+options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=MAX_FACES)
 detector = vision.FaceLandmarker.create_from_options(options)
 
 clahe = cv2.createCLAHE(
@@ -310,92 +341,177 @@ interrupted = False
 run_start = time.perf_counter()
 
 
+def _render_person_full(frame_vis, person: PersonOverlay, img_w, img_h):
+    """Render detailed panels for a single person (full UI mode)."""
+    x_min, y_min, x_max, y_max = person.bbox
+    # Emotion panel (right)
+    if person.last_prediction.size > 0:
+        display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
+        forehead_x = x_min + (x_max - x_min) // 2
+        forehead_y = y_min
+        box_right_x = min(x_max + 30, img_w - 200)
+        box_right_y = max(30, y_min - 20)
+        cv2.line(frame_vis, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
+        frame_vis = draw_transparent_box(frame_vis, box_right_x, box_right_y, 200, 180, alpha=0.5)
+        y_offset = box_right_y + 20
+        for emo in display_order:
+            idx = EMOTION_CLASSES.index(emo)
+            score = person.last_prediction[idx] * 100
+            thickness = 2 if emo == person.dom_emo else 1
+            color = (255, 255, 255) if emo == person.dom_emo else (180, 180, 180)
+            cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
+            y_offset += 20
+
+        # Threat panel (left)
+        box_left_x = max(10, x_min - 220)
+        box_left_y = max(30, y_min + 50)
+        ts_color = (0, 255, 0)
+        if person.threat_score >= 40:
+            ts_color = (0, 165, 255)
+        if person.threat_score >= 70:
+            ts_color = (0, 0, 255)
+        frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
+        cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
+        cv2.putText(frame_vis, f"{person.dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"THREAT SCORE: {person.threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
+        if person.is_asymmetric:
+            cv2.putText(frame_vis, "ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+    return frame_vis
+
+
 def render_overlay(frame_raw: np.ndarray, overlay: OverlayState):
     frame_vis = frame_raw.copy()
     img_h, img_w, _ = frame_vis.shape
-    bbox = overlay.bbox
-    if ui_mode in ("full", "min") and bbox is not None:
-        x_min, y_min, x_max, y_max = bbox
-        cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
 
-    if ui_mode == "full":
-        if bbox is not None and overlay.last_prediction.size > 0:
-            x_min, y_min, x_max, y_max = bbox
-            display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
-            forehead_x = x_min + (x_max - x_min) // 2
-            forehead_y = y_min
-            box_right_x = min(x_max + 30, img_w - 200)
-            box_right_y = max(30, y_min - 20)
-            cv2.line(frame_vis, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
-            frame_vis = draw_transparent_box(frame_vis, box_right_x, box_right_y, 200, 180, alpha=0.5)
-            y_offset = box_right_y + 20
-            for emo in display_order:
-                idx = EMOTION_CLASSES.index(emo)
-                score = overlay.last_prediction[idx] * 100
-                thickness = 2 if emo == overlay.dom_emo else 1
-                color = (255, 255, 255) if emo == overlay.dom_emo else (180, 180, 180)
-                cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
-                y_offset += 20
+    # Multi-person rendering
+    if overlay.people:
+        # Sort by threat descending: primary person = highest threat
+        sorted_people = sorted(overlay.people, key=lambda p: p.threat_score, reverse=True)
+        for idx, person in enumerate(sorted_people):
+            x_min, y_min, x_max, y_max = person.bbox
+            if ui_mode in ("full", "min"):
+                # Bbox with ID label
+                cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
+                label = f"ID:{person.person_id} {person.dom_emo} T:{person.threat_score}"
+                cv2.putText(frame_vis, label, (x_min, max(y_min - 5, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-            box_left_x = max(10, x_min - 220)
-            box_left_y = max(30, y_min + 50)
-            ts_color = (0, 255, 0)
-            if overlay.threat_score >= 40:
-                ts_color = (0, 165, 255)
-            if overlay.threat_score >= 70:
-                ts_color = (0, 0, 255)
-            frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
-            cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
-            cv2.putText(frame_vis, f"{overlay.dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame_vis, f"THREAT SCORE: {overlay.threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
-            if overlay.is_asymmetric:
-                cv2.putText(frame_vis, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+            if ui_mode == "full" and idx == 0:
+                frame_vis = _render_person_full(frame_vis, person, img_w, img_h)
 
-        if overlay.threat_score >= 70:
+        # Global hostile alert if any person >= 70
+        max_threat = max(p.threat_score for p in overlay.people) if overlay.people else 0
+        if ui_mode == "full" and max_threat >= 70:
             cv2.rectangle(frame_vis, (0, 0), (img_w, img_h), (0, 0, 255), 4)
-            cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w // 2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+            cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w // 2 - 200, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-    elif ui_mode == "min":
-        cv2.putText(frame_vis, f"EMO: {overlay.dom_emo}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame_vis, f"THREAT: {overlay.threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame_vis, f"POSE: {overlay.pose_text}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame_vis, f"INFER_OK: {overlay.valid_quality}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame_vis, f"INFER_RAN: {overlay.infer_ran}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame_vis, f"TRACK: {'ok' if overlay.track_ok else 'failed'}", (20, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame_vis, f"DETECT: {'ran' if overlay.detect_ran else 'not'}", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        if ui_mode == "min":
+            y_txt = 30
+            cv2.putText(frame_vis, f"PERSONS: {len(overlay.people)}", (20, y_txt),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            y_txt += 25
+            cv2.putText(frame_vis, f"DETECT: {'ran' if overlay.detect_ran else 'not'}", (20, y_txt),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    elif ui_mode in ("full", "min") and overlay.bbox is not None:
+        # Legacy single-person fallback (tracking disabled)
+        x_min, y_min, x_max, y_max = overlay.bbox
+        cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
+        if ui_mode == "min":
+            cv2.putText(frame_vis, f"EMO: {overlay.dom_emo}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(frame_vis, f"THREAT: {overlay.threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
     return frame_vis
 
 
+def _extract_face_bboxes(face_landmarks_list, work_w, work_h, scale_x, scale_y, img_w, img_h):
+    """Extract all face bboxes from MediaPipe results, scaled to full image coords.
+
+    Returns (detections, landmarks_list) where each detection is (x, y, w, h).
+    """
+    detections = []
+    landmarks_out = []
+    for face_lms in (face_landmarks_list or []):
+        x_vals = [l.x for l in face_lms]
+        y_vals = [l.y for l in face_lms]
+        x_min_w = max(0, int(min(x_vals) * work_w) - 10)
+        x_max_w = min(work_w, int(max(x_vals) * work_w) + 10)
+        y_min_w = max(0, int(min(y_vals) * work_h) - 20)
+        y_max_w = min(work_h, int(max(y_vals) * work_h) + 10)
+
+        x_min = max(0, min(img_w, int(x_min_w * scale_x)))
+        x_max = max(0, min(img_w, int(x_max_w * scale_x)))
+        y_min = max(0, min(img_h, int(y_min_w * scale_y)))
+        y_max = max(0, min(img_h, int(y_max_w * scale_y)))
+
+        bx, by, bw, bh = clip_bbox_xywh(
+            x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h
+        )
+        detections.append((int(bx), int(by), int(bw), int(bh)))
+        landmarks_out.append(face_lms)
+    return detections, landmarks_out
+
+
 def processing_loop():
-    preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
-    last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
-    next_infer_ts_ms = None
+    multi_tracker = MultiPersonTracker(
+        iou_min=float(MATCH_CFG.get("iou_min", 0.15)),
+        dist_max_norm=float(MATCH_CFG.get("dist_max_norm", 0.4)),
+        size_penalty_weight=float(MATCH_CFG.get("size_penalty_weight", 0.3)),
+        reacquire_grace_ms=int(REACQUIRE_CFG.get("grace_ms", 1500)),
+        reacquire_multiplier=float(REACQUIRE_CFG.get("multiplier", 1.5)),
+        ttl_ms=TTL_MS,
+        dedup_iou_threshold=DEDUP_IOU_THRESHOLD,
+        preds_buffer_maxlen=int(config["emotion"]["preds_buffer_maxlen"]),
+    )
+
     next_detect_ts_ms = None
-    tracker = None
-    tracked_bbox = None
-    missed_frames = 0
-    last_track_ok = False
+    prev_clock_ts_ms = None
+
+    # Fallback for tracking-disabled mode (single-face, legacy behaviour)
+    legacy_preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
+    legacy_last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
+    legacy_next_infer_ts_ms = None
 
     while not stop_event.is_set() or not frame_queue.empty():
+        # ---- Drain queue: keep only latest frame, count skipped ----
+        frame_data = None
         try:
-            frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw = frame_queue.get(timeout=0.1)
-            shared_state.update_source_clock(clock_ts_ms)
+            frame_data = frame_queue.get(timeout=0.1)
         except queue.Empty:
             continue
+
+        skipped_frames = 0
+        while True:
+            try:
+                newer = frame_queue.get_nowait()
+                skipped_frames += 1
+                frame_data = newer
+            except queue.Empty:
+                break
+
+        frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw = frame_data
+        shared_state.update_source_clock(clock_ts_ms)
 
         frame_start = time.perf_counter()
         frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
         frame_timings.timings_ms["capture"] = capture_ms
+        frame_timings.skipped_frames = skipped_frames
+        frame_timings.queue_depth = frame_queue.qsize()
 
-        frame_vis = frame_raw
-        img_h, img_w, _ = frame_vis.shape
+        # dt since last processed frame
+        dt_ms = 0.0
+        if prev_clock_ts_ms is not None:
+            dt_ms = float(clock_ts_ms - prev_clock_ts_ms)
+        prev_clock_ts_ms = clock_ts_ms
+        frame_timings.dt_ms = dt_ms
+
+        img_h, img_w, _ = frame_raw.shape
 
         if WORK_FRAME_ENABLED:
             work_frame = cv2.resize(frame_raw, (WORK_FRAME_WIDTH, WORK_FRAME_HEIGHT))
         else:
             work_frame = frame_raw
-
         work_h, work_w, _ = work_frame.shape
         scale_x = img_w / work_w
         scale_y = img_h / work_h
@@ -404,19 +520,17 @@ def processing_loop():
         tracker_ran = False
         track_ok = False
         need_detect_reason = ""
-        landmarks = None
-        roi_bbox = None
+        tracking_diag: dict = {}
 
+        # ==================================================================
+        # PATH A: Multi-person tracking enabled
+        # ==================================================================
         if TRACKING_ENABLED:
-            missing_tracker = (tracker is None or tracked_bbox is None)
-            too_many_missed = (missed_frames > MAX_MISSED_FRAMES)
-            need_detect = missing_tracker or (not last_track_ok) or too_many_missed
-            if missing_tracker:
-                need_detect_reason = "no_tracker"
-            elif not last_track_ok:
-                need_detect_reason = "track_not_ok"
-            elif too_many_missed:
-                need_detect_reason = "missed_limit"
+            # --- decide if detection needed ---
+            no_persons = len(multi_tracker.persons) == 0
+            need_detect = no_persons
+            if no_persons:
+                need_detect_reason = "no_persons"
 
             if not need_detect:
                 if DETECT_EVERY_MS is not None:
@@ -426,135 +540,309 @@ def processing_loop():
                         need_detect = True
                         need_detect_reason = "periodic_ms"
                 else:
-                    periodic_due = (frame_idx % DETECT_EVERY_N_FRAMES == 0)
-                    if periodic_due:
+                    if frame_idx % DETECT_EVERY_N_FRAMES == 0:
                         need_detect = True
                         need_detect_reason = "periodic_frame"
 
-            if not need_detect:
-                need_detect_reason = "track_only"
-                roi_bbox = tracked_bbox
-                with Timer(frame_timings.timings_ms, "tracker"):
-                    ok, bbox = tracker.update(frame_raw)
-                tracker_ran = True
-
-                if ok:
-                    x, y, w, h = clip_bbox_xywh(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), img_w, img_h)
-                    tracked_bbox = (x, y, w, h)
-                    roi_bbox = tracked_bbox
-                    track_ok = True
-                    missed_frames = 0
-                else:
-                    track_ok = False
-                    missed_frames += 1
-                    need_detect = True
-                    need_detect_reason = "track_failed"
-                    tracker = None
-
             if need_detect:
+                # --- Detection frame: MediaPipe multi-face ---
                 detect_ran = True
                 with Timer(frame_timings.timings_ms, "mediapipe"):
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB))
+                    mp_image = mp.Image(
+                        image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB),
+                    )
                     res = detector.detect(mp_image)
+
                 if DETECT_EVERY_MS is not None:
                     next_detect_ts_ms = clock_ts_ms + DETECT_EVERY_MS
 
-                if res.face_landmarks:
-                    landmarks = res.face_landmarks[0]
-                    x_vals = [l.x for l in landmarks]
-                    y_vals = [l.y for l in landmarks]
-                    x_min_w, x_max_w = max(0, int(min(x_vals) * work_w) - 10), min(work_w, int(max(x_vals) * work_w) + 10)
-                    y_min_w, y_max_w = max(0, int(min(y_vals) * work_h) - 20), min(work_h, int(max(y_vals) * work_h) + 10)
+                detections, landmarks_list = _extract_face_bboxes(
+                    res.face_landmarks, work_w, work_h, scale_x, scale_y, img_w, img_h
+                )
 
-                    x_min = max(0, min(img_w, int(x_min_w * scale_x)))
-                    x_max = max(0, min(img_w, int(x_max_w * scale_x)))
-                    y_min = max(0, min(img_h, int(y_min_w * scale_y)))
-                    y_max = max(0, min(img_h, int(y_max_w * scale_y)))
-                    bx, by, bw, bh = clip_bbox_xywh(x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h)
-                    tracked_bbox = (int(bx), int(by), int(bw), int(bh))
-                    roi_bbox = tracked_bbox
+                with Timer(frame_timings.timings_ms, "matching"):
+                    tracking_diag = multi_tracker.update_with_detections(
+                        detections, landmarks_list, clock_ts_ms, img_w, img_h
+                    )
 
-                    tracker = create_tracker(TRACKER_TYPE)
-                    if tracker is not None:
-                        with Timer(frame_timings.timings_ms, "tracker"):
-                            track_ok = tracker.init(frame_raw, tuple(int(v) for v in tracked_bbox))
-                        tracker_ran = True
+                # Re-init per-person OpenCV trackers for detected persons
+                tracker_init_t0 = time.perf_counter()
+                for pid, person in multi_tracker.persons.items():
+                    if person.missed_detect_count == 0:
+                        t = create_tracker(TRACKER_TYPE)
+                        if t is not None:
+                            t.init(frame_raw, tuple(int(v) for v in person.bbox))
+                        person.tracker = t
+                frame_timings.timings_ms["tracker_init"] = (
+                    time.perf_counter() - tracker_init_t0
+                ) * 1000.0
+                track_ok = any(
+                    p.missed_detect_count == 0 for p in multi_tracker.persons.values()
+                )
+            else:
+                # --- Track-only frame: update per-person OpenCV trackers ---
+                need_detect_reason = "track_only"
+                tracker_ran = True
+                tracker_t0 = time.perf_counter()
+
+                for pid, person in list(multi_tracker.persons.items()):
+                    if person.tracker is not None:
+                        ok, bbox = person.tracker.update(frame_raw)
+                        if ok:
+                            x, y, w, h = clip_bbox_xywh(
+                                int(bbox[0]), int(bbox[1]),
+                                int(bbox[2]), int(bbox[3]),
+                                img_w, img_h,
+                            )
+                            person.bbox = (x, y, w, h)
+                            person.last_seen_ts_ms = clock_ts_ms
+                            # Update velocity from tracker
+                            new_c = bbox_center(person.bbox)
+                            if (
+                                person._prev_center is not None
+                                and person._prev_center_ts_ms is not None
+                            ):
+                                pdt = clock_ts_ms - person._prev_center_ts_ms
+                                if pdt > 0:
+                                    vx = (new_c[0] - person._prev_center[0]) / pdt
+                                    vy = (new_c[1] - person._prev_center[1]) / pdt
+                                    a = 0.6
+                                    person.velocity = (
+                                        a * vx + (1 - a) * person.velocity[0],
+                                        a * vy + (1 - a) * person.velocity[1],
+                                    )
+                            person._prev_center = new_c
+                            person._prev_center_ts_ms = clock_ts_ms
+                        else:
+                            person.tracker = None
+                            person.missed_detect_count += 1
                     else:
-                        track_ok = False
-                    missed_frames = 0
-                else:
-                    missed_frames += 1
-                    if missed_frames > MAX_MISSED_FRAMES:
-                        tracker = None
-                        tracked_bbox = None
-                    track_ok = False
-            last_track_ok = track_ok
+                        # Velocity-based fallback
+                        pred = multi_tracker.predict_bbox(person, clock_ts_ms)
+                        person.bbox = pred
+                        person.last_seen_ts_ms = clock_ts_ms
+
+                frame_timings.timings_ms["tracker"] = (
+                    time.perf_counter() - tracker_t0
+                ) * 1000.0
+                multi_tracker.cleanup_expired(clock_ts_ms)
+                track_ok = any(
+                    p.missed_detect_count == 0 for p in multi_tracker.persons.values()
+                )
+
+            # --- Per-person inference & scoring ---
+            people_overlay: list[PersonOverlay] = []
+            any_infer_ran = False
+            any_valid_quality = False
+            total_preprocess_ms = 0.0
+            total_infer_ms = 0.0
+            primary_dom_emo = "SCANNING..."
+            primary_threat = 0
+            primary_pose = "INCONNU"
+
+            for pid, person in multi_tracker.persons.items():
+                pose_text = "INCONNU"
+                is_asymmetric = False
+                local_threat = 0
+
+                if person.landmarks is not None:
+                    pose_text = get_head_pose(person.landmarks)
+                    if pose_text == "FACE":
+                        asym = calculate_global_asymmetry(
+                            person.landmarks, work_w, work_h, SYMMETRY_PAIRS
+                        )
+                        if asym > float(config["asymmetry"]["threshold"]):
+                            is_asymmetric = True
+                            local_threat += 40
+
+                # ROI in work-frame coords for inference
+                bx, by, bw, bh = person.bbox
+                x_min_w = max(0, min(work_w - 1, int(bx / scale_x)))
+                x_max_w = max(0, min(work_w, int((bx + bw) / scale_x)))
+                y_min_w = max(0, min(work_h - 1, int(by / scale_y)))
+                y_max_w = max(0, min(work_h, int((by + bh) / scale_y)))
+
+                person_infer_ran = False
+                if (x_max_w - x_min_w) > 40 and INFER_ENABLED:
+                    any_valid_quality = True
+                    if person.next_infer_ts_ms is None:
+                        person.next_infer_ts_ms = clock_ts_ms
+                    if clock_ts_ms >= person.next_infer_ts_ms:
+                        pp_t0 = time.perf_counter()
+                        face_crop = work_frame[y_min_w:y_max_w, x_min_w:x_max_w]
+                        tensor = None
+                        if face_crop.size > 0:
+                            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                            clahe_img = clahe.apply(gray)
+                            final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
+                            ai_input = cv2.resize(final_input, (48, 48))
+                            tensor = np.expand_dims(ai_input, axis=0)
+                        total_preprocess_ms += (time.perf_counter() - pp_t0) * 1000.0
+
+                        if tensor is not None:
+                            inf_t0 = time.perf_counter()
+                            raw_preds = inference_engine.predict(tensor)
+                            total_infer_ms += (time.perf_counter() - inf_t0) * 1000.0
+                            person.preds_buffer.append(raw_preds)
+                            person.last_prediction = np.mean(
+                                person.preds_buffer, axis=0
+                            )
+                            person_infer_ran = True
+                            any_infer_ran = True
+                            shared_state.inc_infer_count()
+                        person.next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS
+
+                # Emotion & threat
+                dom_emo = "SCANNING..."
+                activation = 0.0
+                if len(person.preds_buffer) > 0:
+                    top_idx = person.last_prediction.argsort()[-1]
+                    dom_emo = EMOTION_CLASSES[top_idx]
+                    activation = person.last_prediction[top_idx] * 100
+                    if dom_emo in ("ANGRY", "CONTEMPT"):
+                        local_threat += int(config["threat"]["angry_contempt_bonus"])
+                    if dom_emo == "FEAR":
+                        local_threat += int(config["threat"]["fear_bonus"])
+
+                people_overlay.append(
+                    PersonOverlay(
+                        person_id=pid,
+                        bbox=(bx, by, bx + bw, by + bh),
+                        dom_emo=dom_emo,
+                        threat_score=local_threat,
+                        pose_text=pose_text,
+                        last_prediction=np.array(person.last_prediction, copy=True),
+                        is_asymmetric=is_asymmetric,
+                    )
+                )
+
+            if total_preprocess_ms > 0:
+                frame_timings.timings_ms["preprocess"] = total_preprocess_ms
+            if total_infer_ms > 0:
+                frame_timings.timings_ms["infer"] = total_infer_ms
+
+            # Summary from primary (highest-threat) person
+            if people_overlay:
+                primary = max(people_overlay, key=lambda p: p.threat_score)
+                primary_dom_emo = primary.dom_emo
+                primary_threat = primary.threat_score
+                primary_pose = primary.pose_text
+
+            # ---- Write metrics ----
+            frame_timings.timings_ms["total"] = (
+                time.perf_counter() - frame_start
+            ) * 1000.0
+            frame_timings.timings_ms["total_processing"] = frame_timings.timings_ms[
+                "total"
+            ]
+            frame_timings.has_face = len(multi_tracker.persons) > 0
+            frame_timings.pose = primary_pose
+            frame_timings.valid_quality = any_valid_quality
+            frame_timings.infer_ran = any_infer_ran
+            frame_timings.detect_ran = detect_ran
+            frame_timings.tracker_ran = tracker_ran
+            frame_timings.track_ok = track_ok
+            frame_timings.need_detect_reason = need_detect_reason
+            frame_timings.detect_every_ms = DETECT_EVERY_MS
+            frame_timings.emotion_top1 = primary_dom_emo
+            frame_timings.emotion_p = 0.0
+            frame_timings.threat_score = primary_threat
+            frame_timings.active_persons = len(multi_tracker.persons)
+            frame_timings.people = [
+                {
+                    "id": po.person_id,
+                    "bbox": list(po.bbox),
+                    "emo": po.dom_emo,
+                    "threat": po.threat_score,
+                    "pose": po.pose_text,
+                }
+                for po in people_overlay
+            ]
+            if tracking_diag:
+                frame_timings.raw_dets = tracking_diag.get("raw_dets", 0)
+                frame_timings.kept_dets = tracking_diag.get("kept_dets", 0)
+                frame_timings.match_events = tracking_diag.get("match_events")
+                frame_timings.new_ids_created = tracking_diag.get("new_ids_created")
+                frame_timings.expired_ids = tracking_diag.get("expired_ids")
+                frame_timings.unmatched_dets = tracking_diag.get("unmatched_dets", 0)
+            profiler.write_frame(frame_timings)
+
+            # ---- Update shared overlay ----
+            shared_state.update_overlay(
+                OverlayState(
+                    frame_idx=frame_idx,
+                    people=people_overlay,
+                    has_face=len(multi_tracker.persons) > 0,
+                    dom_emo=primary_dom_emo,
+                    threat_score=primary_threat,
+                    pose_text=primary_pose,
+                    valid_quality=any_valid_quality,
+                    infer_ran=any_infer_ran,
+                    detect_ran=detect_ran,
+                    track_ok=track_ok,
+                    last_prediction=np.zeros(len(EMOTION_CLASSES), dtype=np.float32),
+                )
+            )
+
+        # ==================================================================
+        # PATH B: Tracking disabled (legacy single-face, detect every frame)
+        # ==================================================================
         else:
             need_detect_reason = "tracking_disabled"
             detect_ran = True
             with Timer(frame_timings.timings_ms, "mediapipe"):
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB))
+                mp_image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB),
+                )
                 res = detector.detect(mp_image)
 
+            roi_bbox = None
+            landmarks = None
             if res.face_landmarks:
                 landmarks = res.face_landmarks[0]
-                x_vals = [l.x for l in landmarks]
-                y_vals = [l.y for l in landmarks]
-                x_min_w, x_max_w = max(0, int(min(x_vals) * work_w) - 10), min(work_w, int(max(x_vals) * work_w) + 10)
-                y_min_w, y_max_w = max(0, int(min(y_vals) * work_h) - 20), min(work_h, int(max(y_vals) * work_h) + 10)
+                dets, _ = _extract_face_bboxes(
+                    [landmarks], work_w, work_h, scale_x, scale_y, img_w, img_h
+                )
+                if dets:
+                    roi_bbox = dets[0]
 
-                x_min = max(0, min(img_w, int(x_min_w * scale_x)))
-                x_max = max(0, min(img_w, int(x_max_w * scale_x)))
-                y_min = max(0, min(img_h, int(y_min_w * scale_y)))
-                y_max = max(0, min(img_h, int(y_max_w * scale_y)))
-                bx, by, bw, bh = clip_bbox_xywh(x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h)
-                roi_bbox = (int(bx), int(by), int(bw), int(bh))
-                tracked_bbox = None
-                tracker = None
-                track_ok = False
-                missed_frames = 0
-            else:
-                tracked_bbox = None
-                track_ok = False
-                missed_frames += 1
-            last_track_ok = False
+            threat_score = 0
+            dom_emo = "SCANNING..."
+            activation = 0.0
+            pose_text = "INCONNU"
+            valid_quality = False
+            infer_ran = False
+            is_asymmetric = False
 
-        threat_score = 0
-        dom_emo = "SCANNING..."
-        activation = 0.0
-        pose_text = "INCONNU"
-        valid_quality = False
-        infer_ran = False
-        is_asymmetric = False
+            x_min = y_min = x_max = y_max = None
+            if roi_bbox is not None:
+                bx, by, bw, bh = roi_bbox
+                x_min, y_min = bx, by
+                x_max, y_max = bx + bw, by + bh
 
-        x_min = y_min = x_max = y_max = None
-        if roi_bbox is not None:
-            bx, by, bw, bh = roi_bbox
-            x_min, y_min = bx, by
-            x_max, y_max = bx + bw, by + bh
+            if landmarks is not None:
+                pose_text = get_head_pose(landmarks)
+                if pose_text == "FACE":
+                    asym_score = calculate_global_asymmetry(
+                        landmarks, work_w, work_h, SYMMETRY_PAIRS
+                    )
+                    if asym_score > float(config["asymmetry"]["threshold"]):
+                        is_asymmetric = True
+                        threat_score += 40
 
-        frame_timings.has_face = roi_bbox is not None
+            if roi_bbox is not None:
+                x_min_w = max(0, min(work_w - 1, int(x_min / scale_x)))
+                x_max_w = max(0, min(work_w, int(x_max / scale_x)))
+                y_min_w = max(0, min(work_h - 1, int(y_min / scale_y)))
+                y_max_w = max(0, min(work_h, int(y_max / scale_y)))
 
-        if landmarks is not None:
-            pose_text = get_head_pose(landmarks)
-            if pose_text == "FACE":
-                asym_score = calculate_global_asymmetry(landmarks, work_w, work_h, SYMMETRY_PAIRS)
-                if asym_score > float(config["asymmetry"]["threshold"]):
-                    is_asymmetric = True
-                    threat_score += 40
-
-        if roi_bbox is not None:
-            x_min_w = max(0, min(work_w - 1, int(x_min / scale_x)))
-            x_max_w = max(0, min(work_w, int(x_max / scale_x)))
-            y_min_w = max(0, min(work_h - 1, int(y_min / scale_y)))
-            y_max_w = max(0, min(work_h, int(y_max / scale_y)))
-
-            if (x_max_w - x_min_w) > 40:
-                if INFER_ENABLED:
-                    if next_infer_ts_ms is None:
-                        next_infer_ts_ms = clock_ts_ms
-                    should_infer = clock_ts_ms >= next_infer_ts_ms
-                    if should_infer:
+                if (x_max_w - x_min_w) > 40 and INFER_ENABLED:
+                    valid_quality = True
+                    if legacy_next_infer_ts_ms is None:
+                        legacy_next_infer_ts_ms = clock_ts_ms
+                    if clock_ts_ms >= legacy_next_infer_ts_ms:
                         with Timer(frame_timings.timings_ms, "preprocess"):
                             face_crop = work_frame[y_min_w:y_max_w, x_min_w:x_max_w]
                             gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
@@ -562,60 +850,59 @@ def processing_loop():
                             final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
                             ai_input = cv2.resize(final_input, (48, 48))
                             tensor = np.expand_dims(ai_input, axis=0)
-
                         with Timer(frame_timings.timings_ms, "infer"):
                             raw_preds = inference_engine.predict(tensor)
-
-                        preds_buffer.append(raw_preds)
-                        last_prediction = np.mean(preds_buffer, axis=0)
+                        legacy_preds_buffer.append(raw_preds)
+                        legacy_last_prediction = np.mean(legacy_preds_buffer, axis=0)
                         infer_ran = True
                         shared_state.inc_infer_count()
-                        next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS
+                        legacy_next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS
 
-                    valid_quality = True
+                if len(legacy_preds_buffer) > 0:
+                    top_idx = legacy_last_prediction.argsort()[-1]
+                    dom_emo = EMOTION_CLASSES[top_idx]
+                    activation = legacy_last_prediction[top_idx] * 100
+                    if dom_emo in ("ANGRY", "CONTEMPT"):
+                        threat_score += int(config["threat"]["angry_contempt_bonus"])
+                    if dom_emo == "FEAR":
+                        threat_score += int(config["threat"]["fear_bonus"])
 
-            if len(preds_buffer) > 0:
-                top_2_idx = last_prediction.argsort()[-2:][::-1]
-                dom_emo = EMOTION_CLASSES[top_2_idx[0]]
-                activation = last_prediction[top_2_idx[0]] * 100
-                if dom_emo in ['ANGRY', 'CONTEMPT']:
-                    threat_score += int(config["threat"]["angry_contempt_bonus"])
-                if dom_emo in ['FEAR']:
-                    threat_score += int(config["threat"]["fear_bonus"])
+            frame_timings.timings_ms["total"] = (
+                time.perf_counter() - frame_start
+            ) * 1000.0
+            frame_timings.timings_ms["total_processing"] = frame_timings.timings_ms[
+                "total"
+            ]
+            frame_timings.has_face = roi_bbox is not None
+            frame_timings.pose = pose_text
+            frame_timings.valid_quality = valid_quality
+            frame_timings.infer_ran = infer_ran
+            frame_timings.detect_ran = detect_ran
+            frame_timings.need_detect_reason = need_detect_reason
+            frame_timings.detect_every_ms = DETECT_EVERY_MS
+            frame_timings.bbox = list(roi_bbox) if roi_bbox is not None else None
+            frame_timings.emotion_top1 = dom_emo
+            frame_timings.emotion_p = float(activation / 100.0)
+            frame_timings.threat_score = int(threat_score)
+            profiler.write_frame(frame_timings)
 
-        frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
-        frame_timings.timings_ms["total_processing"] = frame_timings.timings_ms["total"]
-        frame_timings.pose = pose_text
-        frame_timings.valid_quality = valid_quality
-        frame_timings.infer_ran = infer_ran
-        frame_timings.detect_ran = detect_ran
-        frame_timings.tracker_ran = tracker_ran
-        frame_timings.track_ok = track_ok
-        frame_timings.need_detect_reason = need_detect_reason
-        frame_timings.detect_every_ms = DETECT_EVERY_MS
-        frame_timings.bbox = list(tracked_bbox) if tracked_bbox is not None else None
-        frame_timings.emotion_top1 = dom_emo
-        frame_timings.emotion_p = float(activation / 100.0)
-        frame_timings.threat_score = int(threat_score)
-        profiler.write_frame(frame_timings)
-
-        overlay_bbox = (x_min, y_min, x_max, y_max) if roi_bbox is not None else None
-        shared_state.update_overlay(
-            OverlayState(
-                frame_idx=frame_idx,
-                has_face=roi_bbox is not None,
-                bbox=overlay_bbox,
-                dom_emo=dom_emo,
-                threat_score=int(threat_score),
-                pose_text=pose_text,
-                valid_quality=valid_quality,
-                infer_ran=infer_ran,
-                detect_ran=detect_ran,
-                track_ok=track_ok,
-                last_prediction=np.array(last_prediction, copy=True),
-                is_asymmetric=is_asymmetric,
+            overlay_bbox = (x_min, y_min, x_max, y_max) if roi_bbox is not None else None
+            shared_state.update_overlay(
+                OverlayState(
+                    frame_idx=frame_idx,
+                    has_face=roi_bbox is not None,
+                    bbox=overlay_bbox,
+                    dom_emo=dom_emo,
+                    threat_score=int(threat_score),
+                    pose_text=pose_text,
+                    valid_quality=valid_quality,
+                    infer_ran=infer_ran,
+                    detect_ran=detect_ran,
+                    track_ok=False,
+                    last_prediction=np.array(legacy_last_prediction, copy=True),
+                    is_asymmetric=is_asymmetric,
+                )
             )
-        )
 
 
 def capture_loop():
