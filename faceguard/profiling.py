@@ -35,7 +35,9 @@ class FrameTimings:
     valid_quality: bool = False
     infer_ran: bool = False
     detect_ran: bool = False
+    tracker_ran: bool = False
     track_ok: bool = False
+    need_detect_reason: str = ""
     bbox: list[int] | None = None
     timings_ms: Dict[str, float] = field(default_factory=dict)
     emotion_top1: str = "SCANNING..."
@@ -51,7 +53,9 @@ class FrameTimings:
             "valid_quality": self.valid_quality,
             "infer_ran": self.infer_ran,
             "detect_ran": self.detect_ran,
+            "tracker_ran": self.tracker_ran,
             "track_ok": self.track_ok,
+            "need_detect_reason": self.need_detect_reason,
             "bbox": self.bbox,
             "timings_ms": self.timings_ms,
             "emotion_top1": self.emotion_top1,
@@ -82,6 +86,7 @@ class RunProfiler:
         self._stats: Dict[str, List[float]] = {
             "capture": [],
             "mediapipe": [],
+            "tracker": [],
             "preprocess": [],
             "infer": [],
             "ui": [],
@@ -123,7 +128,7 @@ class RunProfiler:
         print("\n" + "=" * 50)
         print("📊 PROFILING SUMMARY")
         print(f"JSONL: {self.path}")
-        for stage in ["capture", "mediapipe", "preprocess", "infer", "ui", "total"]:
+        for stage in ["capture", "mediapipe", "tracker", "preprocess", "infer", "ui", "total"]:
             print(f"- {stage:10s}: {self._fmt_percentiles(self._stats[stage])}")
 
         totals = self._stats["total"]

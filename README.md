@@ -79,8 +79,8 @@ inference:
 ```yaml
 tracking:
   enabled: true
-  detect_every_n_frames: 10
-  tracker_type: CSRT
+  detect_every_n_frames: 15
+  tracker_type: MOSSE
   max_missed_frames: 30
 ```
 

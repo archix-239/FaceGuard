@@ -54,23 +54,34 @@ def clip_bbox_xywh(x: int, y: int, w: int, h: int, frame_w: int, frame_h: int):
 
 def create_tracker(tracker_type: str):
     t = tracker_type.upper()
-    constructors = []
-    if t == "KCF":
-        constructors = [
-            lambda: cv2.TrackerKCF_create(),
-            lambda: cv2.legacy.TrackerKCF_create(),
-        ]
-    else:  # default CSRT
-        constructors = [
-            lambda: cv2.TrackerCSRT_create(),
-            lambda: cv2.legacy.TrackerCSRT_create(),
-        ]
 
-    for ctor in constructors:
-        try:
-            return ctor()
-        except Exception:
-            continue
+    def ctor_list(name: str):
+        if name == "MOSSE":
+            return [
+                lambda: cv2.TrackerMOSSE_create(),
+                lambda: cv2.legacy.TrackerMOSSE_create(),
+            ]
+        if name == "KCF":
+            return [
+                lambda: cv2.TrackerKCF_create(),
+                lambda: cv2.legacy.TrackerKCF_create(),
+            ]
+        if name == "CSRT":
+            return [
+                lambda: cv2.TrackerCSRT_create(),
+                lambda: cv2.legacy.TrackerCSRT_create(),
+            ]
+        return []
+
+    # Par défaut: MOSSE (léger) puis fallback KCF
+    order = ["MOSSE", "KCF"] if t == "MOSSE" else [t]
+
+    for name in order:
+        for ctor in ctor_list(name):
+            try:
+                return ctor()
+            except Exception:
+                continue
     return None
 
 
@@ -108,8 +119,8 @@ INFER_ENABLED = INFER_FPS > 0.0
 INFER_INTERVAL_MS = (1000.0 / INFER_FPS) if INFER_ENABLED else None
 
 TRACKING_ENABLED = bool(config.get("tracking", {}).get("enabled", True))
-DETECT_EVERY_N_FRAMES = max(1, int(config.get("tracking", {}).get("detect_every_n_frames", 10)))
-TRACKER_TYPE = str(config.get("tracking", {}).get("tracker_type", "CSRT"))
+DETECT_EVERY_N_FRAMES = max(1, int(config.get("tracking", {}).get("detect_every_n_frames", 15)))
+TRACKER_TYPE = str(config.get("tracking", {}).get("tracker_type", "MOSSE"))
 MAX_MISSED_FRAMES = max(0, int(config.get("tracking", {}).get("max_missed_frames", 30)))
 
 print(f"[⏳] Chargement du modèle IA lourd ({MODEL_PATH})... Cela peut prendre 30 secondes.")
@@ -264,15 +275,79 @@ try:
             writer = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
 
         detect_ran = False
+        tracker_ran = False
         track_ok = False
+        need_detect_reason = ""
         landmarks = None
 
         if TRACKING_ENABLED:
-            need_detect = (frame_idx % DETECT_EVERY_N_FRAMES == 0) or tracker is None or missed_frames > MAX_MISSED_FRAMES
-        else:
-            need_detect = True
+            periodic_due = (frame_idx % DETECT_EVERY_N_FRAMES == 0)
+            missing_tracker = (tracker is None or tracked_bbox is None)
+            too_many_missed = (missed_frames > MAX_MISSED_FRAMES)
+            need_detect = periodic_due or missing_tracker or too_many_missed
+            if periodic_due:
+                need_detect_reason = "periodic"
+            elif missing_tracker:
+                need_detect_reason = "no_tracker"
+            elif too_many_missed:
+                need_detect_reason = "missed_limit"
+            else:
+                need_detect_reason = "track_only"
 
-        if need_detect:
+            if not need_detect:
+                with Timer(frame_timings.timings_ms, "tracker"):
+                    ok, bbox = tracker.update(frame_raw)
+                tracker_ran = True
+
+                if ok:
+                    x, y, w, h = clip_bbox_xywh(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), img_w, img_h)
+                    tracked_bbox = (x, y, w, h)
+                    track_ok = True
+                    missed_frames = 0
+                else:
+                    track_ok = False
+                    missed_frames += 1
+                    need_detect = True
+                    need_detect_reason = "track_failed"
+                    tracker = None
+
+            if need_detect:
+                detect_ran = True
+                with Timer(frame_timings.timings_ms, "mediapipe"):
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB))
+                    res = detector.detect(mp_image)
+
+                if res.face_landmarks:
+                    landmarks = res.face_landmarks[0]
+                    last_landmarks = landmarks
+                    x_vals = [l.x for l in landmarks]
+                    y_vals = [l.y for l in landmarks]
+                    x_min_w, x_max_w = max(0, int(min(x_vals) * work_w) - 10), min(work_w, int(max(x_vals) * work_w) + 10)
+                    y_min_w, y_max_w = max(0, int(min(y_vals) * work_h) - 20), min(work_h, int(max(y_vals) * work_h) + 10)
+
+                    x_min = max(0, min(img_w, int(x_min_w * scale_x)))
+                    x_max = max(0, min(img_w, int(x_max_w * scale_x)))
+                    y_min = max(0, min(img_h, int(y_min_w * scale_y)))
+                    y_max = max(0, min(img_h, int(y_max_w * scale_y)))
+                    bx, by, bw, bh = clip_bbox_xywh(x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h)
+                    tracked_bbox = (int(bx), int(by), int(bw), int(bh))
+
+                    tracker = create_tracker(TRACKER_TYPE)
+                    if tracker is not None:
+                        with Timer(frame_timings.timings_ms, "tracker"):
+                            track_ok = tracker.init(frame_raw, tuple(int(v) for v in tracked_bbox))
+                        tracker_ran = True
+                    else:
+                        track_ok = False
+                    missed_frames = 0
+                else:
+                    missed_frames += 1
+                    if missed_frames > MAX_MISSED_FRAMES:
+                        tracker = None
+                        tracked_bbox = None
+                    track_ok = False
+        else:
+            need_detect_reason = "tracking_disabled"
             detect_ran = True
             with Timer(frame_timings.timings_ms, "mediapipe"):
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB))
@@ -292,38 +367,12 @@ try:
                 y_max = max(0, min(img_h, int(y_max_w * scale_y)))
                 bx, by, bw, bh = clip_bbox_xywh(x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h)
                 tracked_bbox = (int(bx), int(by), int(bw), int(bh))
-
-                if TRACKING_ENABLED:
-                    tracker = create_tracker(TRACKER_TYPE)
-                    if tracker is not None:
-                        track_ok = tracker.init(frame_raw, tuple(int(v) for v in tracked_bbox))
-                    else:
-                        track_ok = False
-                else:
-                    tracker = None
-                    track_ok = True
+                tracker = None
+                track_ok = True
                 missed_frames = 0
             else:
-                missed_frames += 1
-                if missed_frames > MAX_MISSED_FRAMES:
-                    tracker = None
-                    tracked_bbox = None
-                track_ok = False
-        else:
-            if TRACKING_ENABLED and tracker is not None and tracked_bbox is not None:
-                ok, bbox = tracker.update(frame_raw)
-                if ok:
-                    x, y, w, h = clip_bbox_xywh(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), img_w, img_h)
-                    tracked_bbox = (x, y, w, h)
-                    track_ok = True
-                    missed_frames = 0
-                else:
-                    track_ok = False
-                    missed_frames += 1
-            else:
                 track_ok = False
                 missed_frames += 1
-
         threat_score = 0
         dom_emo = "SCANNING..."
         activation = 0.0
@@ -478,7 +527,9 @@ try:
         frame_timings.valid_quality = valid_quality
         frame_timings.infer_ran = infer_ran
         frame_timings.detect_ran = detect_ran
+        frame_timings.tracker_ran = tracker_ran
         frame_timings.track_ok = track_ok
+        frame_timings.need_detect_reason = need_detect_reason
         frame_timings.bbox = list(tracked_bbox) if tracked_bbox is not None else None
         frame_timings.emotion_top1 = dom_emo
         frame_timings.emotion_p = float(activation / 100.0)
