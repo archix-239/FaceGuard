@@ -120,9 +120,14 @@ INFER_ENABLED = INFER_FPS > 0.0
 INFER_INTERVAL_MS = (1000.0 / INFER_FPS) if INFER_ENABLED else None
 
 TRACKING_ENABLED = bool(config.get("tracking", {}).get("enabled", True))
-DETECT_EVERY_N_FRAMES = max(1, int(config.get("tracking", {}).get("detect_every_n_frames", 15)))
-TRACKER_TYPE = str(config.get("tracking", {}).get("tracker_type", "MOSSE"))
-MAX_MISSED_FRAMES = max(0, int(config.get("tracking", {}).get("max_missed_frames", 30)))
+tracking_cfg = config.get("tracking", {})
+detect_every_ms_raw = tracking_cfg.get("detect_every_ms")
+DETECT_EVERY_MS = float(detect_every_ms_raw) if detect_every_ms_raw is not None else None
+if DETECT_EVERY_MS is not None and DETECT_EVERY_MS <= 0:
+    DETECT_EVERY_MS = None
+DETECT_EVERY_N_FRAMES = max(1, int(tracking_cfg.get("detect_every_n_frames", 15)))
+TRACKER_TYPE = str(tracking_cfg.get("tracker_type", "MOSSE"))
+MAX_MISSED_FRAMES = max(0, int(tracking_cfg.get("max_missed_frames", 30)))
 
 print(f"[⏳] Chargement du modèle IA lourd ({MODEL_PATH})... Cela peut prendre 30 secondes.")
 try:
@@ -135,6 +140,7 @@ except Exception as e:
 preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
 last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
 next_infer_ts_ms = None
+next_detect_ts_ms = None
 
 print("[⏳] Initialisation des capteurs géométriques...")
 base_options = python.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH)
@@ -233,6 +239,7 @@ tracker = None
 tracked_bbox = None
 last_landmarks = None
 missed_frames = 0
+last_track_ok = False
 
 try:
     while cap.isOpened():
@@ -286,20 +293,31 @@ try:
         roi_bbox = None
 
         if TRACKING_ENABLED:
-            periodic_due = (frame_idx % DETECT_EVERY_N_FRAMES == 0)
             missing_tracker = (tracker is None or tracked_bbox is None)
             too_many_missed = (missed_frames > MAX_MISSED_FRAMES)
-            need_detect = periodic_due or missing_tracker or too_many_missed
-            if periodic_due:
-                need_detect_reason = "periodic"
-            elif missing_tracker:
+            need_detect = missing_tracker or (not last_track_ok) or too_many_missed
+            if missing_tracker:
                 need_detect_reason = "no_tracker"
+            elif not last_track_ok:
+                need_detect_reason = "track_not_ok"
             elif too_many_missed:
                 need_detect_reason = "missed_limit"
-            else:
-                need_detect_reason = "track_only"
 
             if not need_detect:
+                if DETECT_EVERY_MS is not None:
+                    if next_detect_ts_ms is None:
+                        next_detect_ts_ms = clock_ts_ms
+                    if clock_ts_ms >= next_detect_ts_ms:
+                        need_detect = True
+                        need_detect_reason = "periodic_ms"
+                else:
+                    periodic_due = (frame_idx % DETECT_EVERY_N_FRAMES == 0)
+                    if periodic_due:
+                        need_detect = True
+                        need_detect_reason = "periodic_frame"
+
+            if not need_detect:
+                need_detect_reason = "track_only"
                 roi_bbox = tracked_bbox
                 with Timer(frame_timings.timings_ms, "tracker"):
                     ok, bbox = tracker.update(frame_raw)
@@ -323,6 +341,8 @@ try:
                 with Timer(frame_timings.timings_ms, "mediapipe"):
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB))
                     res = detector.detect(mp_image)
+                if DETECT_EVERY_MS is not None:
+                    next_detect_ts_ms = clock_ts_ms + DETECT_EVERY_MS
 
                 if res.face_landmarks:
                     landmarks = res.face_landmarks[0]
@@ -354,6 +374,7 @@ try:
                         tracker = None
                         tracked_bbox = None
                     track_ok = False
+            last_track_ok = track_ok
         else:
             need_detect_reason = "tracking_disabled"
             detect_ran = True
@@ -383,6 +404,7 @@ try:
                 tracked_bbox = None
                 track_ok = False
                 missed_frames += 1
+            last_track_ok = False
         threat_score = 0
         dom_emo = "SCANNING..."
         activation = 0.0
@@ -540,6 +562,7 @@ try:
         frame_timings.tracker_ran = tracker_ran
         frame_timings.track_ok = track_ok
         frame_timings.need_detect_reason = need_detect_reason
+        frame_timings.detect_every_ms = DETECT_EVERY_MS
         frame_timings.bbox = list(tracked_bbox) if tracked_bbox is not None else None
         frame_timings.emotion_top1 = dom_emo
         frame_timings.emotion_p = float(activation / 100.0)
