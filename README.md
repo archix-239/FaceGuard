@@ -97,7 +97,8 @@ tracking:
   enabled: true
   max_faces: 2
   ttl_ms: 2000
-  iou_match_threshold: 0.3
+  iou_match_threshold: 0.2
+  centroid_match_threshold: 0.15
 ```
 - Chaque visage garde un `person_id` stable (matching IoU + fallback centroid), avec états séparés (buffer émotions, tracking, score).
 
