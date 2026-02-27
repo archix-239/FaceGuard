@@ -97,10 +97,18 @@ tracking:
   enabled: true
   max_faces: 2
   ttl_ms: 2000
-  iou_match_threshold: 0.2
-  centroid_match_threshold: 0.15
+  match:
+    w_iou: 0.6
+    w_dist: 0.4
+    iou_min: 0.05
+    dist_max_norm: 0.15
+  reacquire:
+    enabled: true
+    grace_ms: 800
+    dist_max_norm_multiplier: 1.5
 ```
-- Chaque visage garde un `person_id` stable (matching IoU + fallback centroid), avec états séparés (buffer émotions, tracking, score).
+- Chaque visage garde un `person_id` stable via matching coût global (IoU + distance centroïde + gating) + fenêtre de réacquisition permissive avant création d’un nouvel ID.
+- Les logs JSONL incluent `match_events`, `new_ids_created`, `unmatched_dets` pour diagnostiquer les resets d’ID.
 
 - Tracking ROI (detect rarely, track often):
 ```yaml

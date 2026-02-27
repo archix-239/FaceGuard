@@ -41,8 +41,20 @@ def _apply_path_resolution(config: Dict[str, Any]) -> Dict[str, Any]:
     tracking_cfg = out.get("tracking", {})
     tracking_cfg.setdefault("max_faces", 2)
     tracking_cfg.setdefault("ttl_ms", 2000)
-    tracking_cfg.setdefault("iou_match_threshold", 0.2)
-    tracking_cfg.setdefault("centroid_match_threshold", 0.15)
+
+    match_cfg = tracking_cfg.get("match", {})
+    match_cfg.setdefault("w_iou", 0.6)
+    match_cfg.setdefault("w_dist", 0.4)
+    match_cfg.setdefault("iou_min", 0.05)
+    match_cfg.setdefault("dist_max_norm", 0.15)
+    tracking_cfg["match"] = match_cfg
+
+    reacquire_cfg = tracking_cfg.get("reacquire", {})
+    reacquire_cfg.setdefault("enabled", True)
+    reacquire_cfg.setdefault("grace_ms", 800)
+    reacquire_cfg.setdefault("dist_max_norm_multiplier", 1.5)
+    tracking_cfg["reacquire"] = reacquire_cfg
+
     out["tracking"] = tracking_cfg
 
     runtime_cfg = out.get("runtime", {})

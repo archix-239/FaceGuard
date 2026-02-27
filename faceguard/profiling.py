@@ -45,6 +45,9 @@ class FrameTimings:
     emotion_p: float = 0.0
     threat_score: int = 0
     people: list[dict] = field(default_factory=list)
+    match_events: list[dict] = field(default_factory=list)
+    new_ids_created: int = 0
+    unmatched_dets: int = 0
 
     def to_json_line(self) -> str:
         payload = {
@@ -65,6 +68,9 @@ class FrameTimings:
             "emotion_p": self.emotion_p,
             "threat_score": self.threat_score,
             "people": self.people,
+            "match_events": self.match_events,
+            "new_ids_created": self.new_ids_created,
+            "unmatched_dets": self.unmatched_dets,
         }
         return json.dumps(payload, ensure_ascii=False)
 

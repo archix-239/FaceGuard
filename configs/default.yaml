@@ -58,9 +58,16 @@ tracking:
   enabled: true
   max_faces: 2
   ttl_ms: 2000
-  iou_match_threshold: 0.2
-  centroid_match_threshold: 0.15
   detect_every_ms: 400
   detect_every_n_frames: 15
   tracker_type: MOSSE
   max_missed_frames: 30
+  match:
+    w_iou: 0.6
+    w_dist: 0.4
+    iou_min: 0.05
+    dist_max_norm: 0.15
+  reacquire:
+    enabled: true
+    grace_ms: 800
+    dist_max_norm_multiplier: 1.5

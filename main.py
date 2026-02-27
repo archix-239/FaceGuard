@@ -151,6 +151,9 @@ class PersonState:
     infer_ran: bool = False
     is_asymmetric: bool = False
     next_infer_ts_ms: float | None = None
+    prev_center: tuple[float, float] | None = None
+    velocity_xy: tuple[float, float] = (0.0, 0.0)
+    prev_motion_ts_ms: int | None = None
 
 
 @dataclass
@@ -293,40 +296,91 @@ def bbox_from_landmarks(landmarks, work_w, work_h, img_w, img_h, scale_x, scale_
     return int(bx), int(by), int(bw), int(bh)
 
 
+def bbox_center(bbox_xywh: tuple[int, int, int, int]) -> tuple[float, float]:
+    x, y, w, h = bbox_xywh
+    return x + w / 2.0, y + h / 2.0
+
+
+def predict_bbox_xywh(person: PersonState, target_ts_ms: int, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
+    x, y, w, h = person.bbox_xywh
+    dt_s = 0.0
+    if person.prev_motion_ts_ms is not None:
+        dt_s = max(0.0, (target_ts_ms - person.prev_motion_ts_ms) / 1000.0)
+    vx, vy = person.velocity_xy
+    px = int(round(x + vx * dt_s))
+    py = int(round(y + vy * dt_s))
+    return clip_bbox_xywh(px, py, w, h, frame_w, frame_h)
+
+
+def update_person_motion(person: PersonState, new_bbox: tuple[int, int, int, int], ts_ms: int):
+    new_center = bbox_center(new_bbox)
+    if person.prev_center is not None and person.prev_motion_ts_ms is not None:
+        dt_s = max(1e-6, (ts_ms - person.prev_motion_ts_ms) / 1000.0)
+        vx = (new_center[0] - person.prev_center[0]) / dt_s
+        vy = (new_center[1] - person.prev_center[1]) / dt_s
+        person.velocity_xy = (vx, vy)
+    person.prev_center = new_center
+    person.prev_motion_ts_ms = int(ts_ms)
+
+
+def bbox_size_penalty(det_bbox: tuple[int, int, int, int], pred_bbox: tuple[int, int, int, int]) -> float:
+    _, _, dw, dh = det_bbox
+    _, _, pw, ph = pred_bbox
+    a_det = max(1.0, float(dw * dh))
+    a_pred = max(1.0, float(pw * ph))
+    return abs(math.log(a_det / a_pred))
+
+
 def associate_detections(
     detections: list[dict],
     people: dict[int, PersonState],
-    iou_match_threshold: float,
-    centroid_match_threshold: float,
     image_diag: float,
-) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    frame_w: int,
+    frame_h: int,
+    w_iou: float,
+    w_dist: float,
+    iou_min: float,
+    dist_max_norm: float,
+) -> tuple[list[dict], list[int], list[int]]:
     if not detections or not people:
         return [], list(range(len(detections))), list(people.keys())
 
-    candidates = []
+    w_sum = max(1e-6, w_iou + w_dist)
+    wi = w_iou / w_sum
+    wd = w_dist / w_sum
+    ws = 0.1
+
+    candidates: list[dict] = []
     for det_idx, det in enumerate(detections):
         db = det["bbox_xywh"]
         for person_id, person in people.items():
-            pb = person.bbox_xywh  # bbox trackée courante
+            pb = predict_bbox_xywh(person, det["clock_ts_ms"], frame_w, frame_h)
             iou_score = iou_xywh(db, pb)
             dist_norm = centroid_distance_norm(db, pb, image_diag)
-            iou_ok = iou_score >= iou_match_threshold
-            dist_ok = dist_norm <= centroid_match_threshold
-            if iou_ok or dist_ok:
-                # iou-first priority, then better IoU, then shorter centroid distance
-                candidates.append((1 if iou_ok else 0, iou_score, -dist_norm, det_idx, person_id))
+            size_pen = bbox_size_penalty(db, pb)
+            cost = wi * (1.0 - iou_score) + wd * dist_norm + ws * size_pen
+            if not (iou_score >= iou_min or dist_norm <= dist_max_norm):
+                continue
+            matched_by = "iou" if iou_score >= iou_min else "dist"
+            candidates.append({
+                "det_idx": det_idx,
+                "person_id": person_id,
+                "iou": float(iou_score),
+                "dist_norm": float(dist_norm),
+                "cost": float(cost),
+                "matched_by": matched_by,
+            })
 
-    candidates.sort(reverse=True)
+    candidates.sort(key=lambda x: x["cost"])
     used_det = set()
     used_person = set()
-    matches: list[tuple[int, int]] = []
-
-    for _, _, _, det_idx, person_id in candidates:
-        if det_idx in used_det or person_id in used_person:
+    matches: list[dict] = []
+    for cand in candidates:
+        if cand["det_idx"] in used_det or cand["person_id"] in used_person:
             continue
-        used_det.add(det_idx)
-        used_person.add(person_id)
-        matches.append((det_idx, person_id))
+        used_det.add(cand["det_idx"])
+        used_person.add(cand["person_id"])
+        matches.append(cand)
 
     unmatched_det = [i for i in range(len(detections)) if i not in used_det]
     unmatched_people = [pid for pid in people.keys() if pid not in used_person]
@@ -384,8 +438,15 @@ TRACKER_TYPE = str(tracking_cfg.get("tracker_type", "MOSSE"))
 MAX_MISSED_FRAMES = max(0, int(tracking_cfg.get("max_missed_frames", 30)))
 MAX_FACES = max(1, int(tracking_cfg.get("max_faces", 2)))
 TTL_MS = max(0, int(tracking_cfg.get("ttl_ms", 2000)))
-IOU_MATCH_THRESHOLD = float(tracking_cfg.get("iou_match_threshold", 0.2))
-CENTROID_MATCH_THRESHOLD = float(tracking_cfg.get("centroid_match_threshold", 0.15))
+match_cfg = tracking_cfg.get("match", {})
+reacquire_cfg = tracking_cfg.get("reacquire", {})
+MATCH_W_IOU = float(match_cfg.get("w_iou", tracking_cfg.get("w_iou", 0.6)))
+MATCH_W_DIST = float(match_cfg.get("w_dist", tracking_cfg.get("w_dist", 0.4)))
+MATCH_IOU_MIN = float(match_cfg.get("iou_min", tracking_cfg.get("iou_match_threshold", 0.05)))
+MATCH_DIST_MAX_NORM = float(match_cfg.get("dist_max_norm", tracking_cfg.get("centroid_match_threshold", 0.15)))
+REACQUIRE_ENABLED = bool(reacquire_cfg.get("enabled", True))
+REACQUIRE_GRACE_MS = int(reacquire_cfg.get("grace_ms", 800))
+REACQUIRE_DIST_MULTIPLIER = float(reacquire_cfg.get("dist_max_norm_multiplier", 1.5))
 BBOX_SMOOTH_ALPHA = 0.6
 
 print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
@@ -566,6 +627,9 @@ def process_backlog_track_only_frame(
     frame_timings.detect_every_ms = DETECT_EVERY_MS
     frame_timings.infer_ran = False
     frame_timings.people = people_payload
+    frame_timings.match_events = []
+    frame_timings.new_ids_created = 0
+    frame_timings.unmatched_dets = 0
     if overlays:
         top_person = max(overlays, key=lambda p: p.threat_score)
         frame_timings.bbox = list(people[top_person.person_id].bbox_xywh)
@@ -642,6 +706,10 @@ def processing_loop():
                     need_detect_reason = "periodic_frame"
 
         detections: list[dict] = []
+        person_landmarks: dict[int, object] = {}
+        match_events: list[dict] = []
+        new_ids_created = 0
+        unmatched_det_count = 0
         if need_detect:
             detect_ran = True
             with Timer(frame_timings.timings_ms, "mediapipe"):
@@ -655,29 +723,110 @@ def processing_loop():
                 bbox_xywh = bbox_from_landmarks(landmarks, work_w, work_h, img_w, img_h, scale_x, scale_y)
                 detections.append({"bbox_xywh": bbox_xywh, "landmarks": landmarks})
 
+            for det in detections:
+                det["clock_ts_ms"] = clock_ts_ms
+
             image_diag = math.sqrt(float(img_w * img_w + img_h * img_h))
-            matches, unmatched_det, _ = associate_detections(
-                detections,
-                people,
-                IOU_MATCH_THRESHOLD,
-                CENTROID_MATCH_THRESHOLD,
-                image_diag,
+            matches, unmatched_det, unmatched_people = associate_detections(
+                detections=detections,
+                people=people,
+                image_diag=image_diag,
+                frame_w=img_w,
+                frame_h=img_h,
+                w_iou=MATCH_W_IOU,
+                w_dist=MATCH_W_DIST,
+                iou_min=MATCH_IOU_MIN,
+                dist_max_norm=MATCH_DIST_MAX_NORM,
             )
-            for det_idx, person_id in matches:
-                det = detections[det_idx]
-                person = people[person_id]
+            match_events = [
+                {
+                    "det_idx": int(m["det_idx"]),
+                    "person_id": int(m["person_id"]),
+                    "iou": float(m["iou"]),
+                    "dist_norm": float(m["dist_norm"]),
+                    "cost": float(m["cost"]),
+                    "matched_by": m["matched_by"],
+                }
+                for m in matches
+            ]
+
+            matched_det_idx = {m["det_idx"] for m in matches}
+            matched_person_ids = {m["person_id"] for m in matches}
+
+            for m in matches:
+                det = detections[m["det_idx"]]
+                person = people[m["person_id"]]
                 person.bbox_xywh = smooth_bbox_xywh(person.bbox_xywh, det["bbox_xywh"], BBOX_SMOOTH_ALPHA, img_w, img_h)
                 person.last_seen_ts_ms = clock_ts_ms
                 person.missed_frames = 0
                 person.track_ok = True
+                person_landmarks[person.person_id] = det.get("landmarks")
+                update_person_motion(person, person.bbox_xywh, clock_ts_ms)
                 person.tracker = create_tracker(TRACKER_TYPE) if TRACKING_ENABLED else None
                 if person.tracker is not None:
                     with Timer(frame_timings.timings_ms, "tracker"):
                         person.track_ok = person.tracker.init(frame_raw, tuple(int(v) for v in person.bbox_xywh))
                     tracker_ran = True
 
+            # permissive reacquire window before creating new IDs
+            if REACQUIRE_ENABLED and unmatched_det and unmatched_people:
+                for det_idx in list(unmatched_det):
+                    det = detections[det_idx]
+                    best = None
+                    for person_id in unmatched_people:
+                        person = people[person_id]
+                        if (clock_ts_ms - person.last_seen_ts_ms) > REACQUIRE_GRACE_MS:
+                            continue
+                        pred_bbox = predict_bbox_xywh(person, clock_ts_ms, img_w, img_h)
+                        dist_norm = centroid_distance_norm(det["bbox_xywh"], pred_bbox, image_diag)
+                        iou_score = iou_xywh(det["bbox_xywh"], pred_bbox)
+                        dist_gate = MATCH_DIST_MAX_NORM * REACQUIRE_DIST_MULTIPLIER
+                        if not (iou_score >= MATCH_IOU_MIN or dist_norm <= dist_gate):
+                            continue
+                        cost = (1.0 - iou_score) + dist_norm
+                        if best is None or cost < best["cost"]:
+                            best = {
+                                "person_id": person_id,
+                                "cost": cost,
+                                "iou": iou_score,
+                                "dist_norm": dist_norm,
+                            }
+                    if best is None:
+                        continue
+                    person = people[best["person_id"]]
+                    person.bbox_xywh = smooth_bbox_xywh(person.bbox_xywh, det["bbox_xywh"], BBOX_SMOOTH_ALPHA, img_w, img_h)
+                    person.last_seen_ts_ms = clock_ts_ms
+                    person.missed_frames = 0
+                    person.track_ok = True
+                    person_landmarks[person.person_id] = det.get("landmarks")
+                    update_person_motion(person, person.bbox_xywh, clock_ts_ms)
+                    person.tracker = create_tracker(TRACKER_TYPE) if TRACKING_ENABLED else None
+                    if person.tracker is not None:
+                        with Timer(frame_timings.timings_ms, "tracker"):
+                            person.track_ok = person.tracker.init(frame_raw, tuple(int(v) for v in person.bbox_xywh))
+                        tracker_ran = True
+                    matched_det_idx.add(det_idx)
+                    matched_person_ids.add(best["person_id"])
+                    if det_idx in unmatched_det:
+                        unmatched_det.remove(det_idx)
+                    if best["person_id"] in unmatched_people:
+                        unmatched_people.remove(best["person_id"])
+                    match_events.append(
+                        {
+                            "det_idx": int(det_idx),
+                            "person_id": int(best["person_id"]),
+                            "iou": float(best["iou"]),
+                            "dist_norm": float(best["dist_norm"]),
+                            "cost": float(best["cost"]),
+                            "matched_by": "reacquire",
+                        }
+                    )
+
+            new_ids_created = 0
+            unmatched_det_count = len(unmatched_det)
             if len(detections) == 1 and len(unmatched_det) > 1:
                 unmatched_det = unmatched_det[:1]
+
             for det_idx in unmatched_det:
                 det = detections[det_idx]
                 preds_len = int(config["emotion"]["preds_buffer_maxlen"])
@@ -688,6 +837,7 @@ def processing_loop():
                     preds_buffer=deque(maxlen=preds_len),
                     last_prediction=np.zeros(len(EMOTION_CLASSES), dtype=np.float32),
                 )
+                update_person_motion(person, person.bbox_xywh, clock_ts_ms)
                 if TRACKING_ENABLED:
                     person.tracker = create_tracker(TRACKER_TYPE)
                     if person.tracker is not None:
@@ -695,7 +845,9 @@ def processing_loop():
                             person.track_ok = person.tracker.init(frame_raw, tuple(int(v) for v in person.bbox_xywh))
                         tracker_ran = True
                 people[next_person_id] = person
+                person_landmarks[person.person_id] = det.get("landmarks")
                 next_person_id += 1
+                new_ids_created += 1
         elif TRACKING_ENABLED:
             need_detect_reason = "track_only"
             for person in list(people.values()):
@@ -712,6 +864,7 @@ def processing_loop():
                     person.track_ok = True
                     person.last_seen_ts_ms = clock_ts_ms
                     person.missed_frames = 0
+                    update_person_motion(person, person.bbox_xywh, clock_ts_ms)
                 else:
                     person.track_ok = False
                     person.missed_frames += 1
@@ -734,12 +887,7 @@ def processing_loop():
             person.threat_score = 0
 
             # pose/asym only if we have detect landmarks this frame and matched person
-            matched_landmarks = None
-            if detect_ran:
-                for det in detections:
-                    if det["bbox_xywh"] == bbox_xywh:
-                        matched_landmarks = det["landmarks"]
-                        break
+            matched_landmarks = person_landmarks.get(person.person_id) if detect_ran else None
             if matched_landmarks is not None:
                 person.pose_text = get_head_pose(matched_landmarks)
                 if person.pose_text == "FACE":
@@ -831,6 +979,9 @@ def processing_loop():
             frame_timings.emotion_p = top_person.activation / 100.0
             frame_timings.threat_score = top_person.threat_score
         frame_timings.people = people_payload
+        frame_timings.match_events = match_events
+        frame_timings.new_ids_created = int(new_ids_created)
+        frame_timings.unmatched_dets = int(unmatched_det_count)
         profiler.write_frame(frame_timings)
 
         shared_state.update_overlay(OverlayState(frame_idx=frame_idx, detect_ran=detect_ran, people=overlays))
