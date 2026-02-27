@@ -47,3 +47,9 @@ work_frame:
   enabled: true
   width: 640
   height: 360
+
+tracking:
+  enabled: true
+  detect_every_n_frames: 15
+  tracker_type: MOSSE
+  max_missed_frames: 30

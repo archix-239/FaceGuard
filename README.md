@@ -75,6 +75,15 @@ inference:
 ```
 - `inference.fps: 0` (ou `null`) désactive l’inférence (mode mesure pipeline sans IA).
 
+- Tracking ROI (detect rarely, track often):
+```yaml
+tracking:
+  enabled: true
+  detect_every_n_frames: 15
+  tracker_type: MOSSE
+  max_missed_frames: 30
+```
+
 ## Record / Replay
 - Enregistrer une session:
 ```bash
