@@ -84,6 +84,11 @@ tracking:
   max_missed_frames: 30
 ```
 
+- Override runtime de la cadence d’inférence (sans éditer YAML):
+```bash
+python main.py --fps-infer 2 --ui off --max-seconds 20
+```
+
 ## Record / Replay
 - Enregistrer une session:
 ```bash
