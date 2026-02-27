@@ -41,6 +41,8 @@ def _apply_path_resolution(config: Dict[str, Any]) -> Dict[str, Any]:
     tracking_cfg = out.get("tracking", {})
     tracking_cfg.setdefault("max_faces", 2)
     tracking_cfg.setdefault("ttl_ms", 2000)
+    tracking_cfg.setdefault("nms_iou_threshold", 0.5)
+    tracking_cfg.setdefault("duplicate_iou_block", 0.4)
 
     match_cfg = tracking_cfg.get("match", {})
     match_cfg.setdefault("w_iou", 0.6)

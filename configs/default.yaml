@@ -62,6 +62,8 @@ tracking:
   detect_every_n_frames: 15
   tracker_type: MOSSE
   max_missed_frames: 30
+  nms_iou_threshold: 0.5
+  duplicate_iou_block: 0.4
   match:
     w_iou: 0.6
     w_dist: 0.4

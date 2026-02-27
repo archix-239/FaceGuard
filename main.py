@@ -331,6 +331,19 @@ def bbox_size_penalty(det_bbox: tuple[int, int, int, int], pred_bbox: tuple[int,
     return abs(math.log(a_det / a_pred))
 
 
+def nms_xywh(detections: list[dict], iou_threshold: float = 0.5) -> list[dict]:
+    kept: list[dict] = []
+    for det in sorted(detections, key=lambda d: d.get("area", 0), reverse=True):
+        keep = True
+        for k in kept:
+            if iou_xywh(det["bbox_xywh"], k["bbox_xywh"]) > iou_threshold:
+                keep = False
+                break
+        if keep:
+            kept.append(det)
+    return kept
+
+
 def associate_detections(
     detections: list[dict],
     people: dict[int, PersonState],
@@ -448,6 +461,8 @@ REACQUIRE_ENABLED = bool(reacquire_cfg.get("enabled", True))
 REACQUIRE_GRACE_MS = int(reacquire_cfg.get("grace_ms", 800))
 REACQUIRE_DIST_MULTIPLIER = float(reacquire_cfg.get("dist_max_norm_multiplier", 1.5))
 BBOX_SMOOTH_ALPHA = 0.6
+NMS_IOU_THRESHOLD = float(tracking_cfg.get("nms_iou_threshold", 0.5))
+DUPLICATE_IOU_BLOCK = float(tracking_cfg.get("duplicate_iou_block", 0.4))
 
 print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
 try:
@@ -721,8 +736,10 @@ def processing_loop():
 
             for landmarks in (res.face_landmarks or [])[:MAX_FACES]:
                 bbox_xywh = bbox_from_landmarks(landmarks, work_w, work_h, img_w, img_h, scale_x, scale_y)
-                detections.append({"bbox_xywh": bbox_xywh, "landmarks": landmarks})
+                bx, by, bw, bh = bbox_xywh
+                detections.append({"bbox_xywh": bbox_xywh, "landmarks": landmarks, "area": int(bw * bh)})
 
+            detections = nms_xywh(detections, iou_threshold=NMS_IOU_THRESHOLD)
             for det in detections:
                 det["clock_ts_ms"] = clock_ts_ms
 
@@ -829,6 +846,15 @@ def processing_loop():
 
             for det_idx in unmatched_det:
                 det = detections[det_idx]
+                det_bbox = det["bbox_xywh"]
+                is_duplicate = False
+                for existing_person in people.values():
+                    if iou_xywh(det_bbox, existing_person.bbox_xywh) > DUPLICATE_IOU_BLOCK:
+                        is_duplicate = True
+                        break
+                if is_duplicate:
+                    continue
+
                 preds_len = int(config["emotion"]["preds_buffer_maxlen"])
                 person = PersonState(
                     person_id=next_person_id,

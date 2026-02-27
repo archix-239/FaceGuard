@@ -109,6 +109,7 @@ tracking:
 ```
 - Chaque visage garde un `person_id` stable via matching coût global (IoU + distance centroïde + gating) + fenêtre de réacquisition permissive avant création d’un nouvel ID.
 - Les logs JSONL incluent `match_events`, `new_ids_created`, `unmatched_dets` pour diagnostiquer les resets d’ID.
+- NMS est appliqué avant association pour supprimer les doublons detector, puis un garde-fou bloque la création de nouvel ID si la détection chevauche fortement un ID existant.
 
 - Tracking ROI (detect rarely, track often):
 ```yaml
