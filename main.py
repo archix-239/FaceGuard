@@ -5,7 +5,6 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.vision.drawing_utils import draw_landmarks as mp_draw_landmarks, DrawingSpec as MpDrawingSpec
 from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarksConnections
-import tensorflow as tf
 import numpy as np
 from collections import deque
 import math
@@ -14,6 +13,7 @@ import time
 
 from faceguard.config import load_config
 from faceguard.profiling import Timer, FrameTimings, RunProfiler
+from faceguard.services.inference_backend import create_inference_backend
 
 
 UI_MODES = ("full", "min", "off")
@@ -114,10 +114,15 @@ EMOTION_CLASSES = config["emotion"]["classes"]
 WORK_FRAME_ENABLED = bool(config.get("work_frame", {}).get("enabled", False))
 WORK_FRAME_WIDTH = int(config.get("work_frame", {}).get("width", 640))
 WORK_FRAME_HEIGHT = int(config.get("work_frame", {}).get("height", 360))
-infer_cfg_fps = args.fps_infer if args.fps_infer is not None else config.get("inference", {}).get("fps", 8.0)
+inference_cfg = config.get("inference", {})
+infer_cfg_fps = args.fps_infer if args.fps_infer is not None else inference_cfg.get("fps", 8.0)
 INFER_FPS = float(infer_cfg_fps) if infer_cfg_fps is not None else 0.0
 INFER_ENABLED = INFER_FPS > 0.0
 INFER_INTERVAL_MS = (1000.0 / INFER_FPS) if INFER_ENABLED else None
+INFER_BACKEND = str(inference_cfg.get("backend", "keras")).lower()
+TFLITE_MODEL_PATH = inference_cfg.get("tflite_model_path")
+TFLITE_NUM_THREADS = int(inference_cfg.get("tflite_num_threads", 1))
+INFER_WARMUP_RUNS = int(inference_cfg.get("warmup_runs", 0))
 
 TRACKING_ENABLED = bool(config.get("tracking", {}).get("enabled", True))
 tracking_cfg = config.get("tracking", {})
@@ -129,18 +134,33 @@ DETECT_EVERY_N_FRAMES = max(1, int(tracking_cfg.get("detect_every_n_frames", 15)
 TRACKER_TYPE = str(tracking_cfg.get("tracker_type", "MOSSE"))
 MAX_MISSED_FRAMES = max(0, int(tracking_cfg.get("max_missed_frames", 30)))
 
-print(f"[⏳] Chargement du modèle IA lourd ({MODEL_PATH})... Cela peut prendre 30 secondes.")
+print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
 try:
-    emotion_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-    print("[✅] Modèle IA chargé avec succès dans la RAM !")
+    inference_engine = create_inference_backend(
+        backend=INFER_BACKEND,
+        keras_model_path=MODEL_PATH,
+        tflite_model_path=TFLITE_MODEL_PATH,
+        tflite_num_threads=TFLITE_NUM_THREADS,
+    )
+    engine_details = inference_engine.details()
+    print(
+        "[✅] Backend inférence prêt: "
+        f"backend={engine_details.backend}, model={engine_details.model_path}, "
+        f"input(shape={engine_details.input_shape}, dtype={engine_details.input_dtype}), "
+        f"output(shape={engine_details.output_shape}, dtype={engine_details.output_dtype})"
+    )
 except Exception as e:
-    print(f"[❌] ERREUR FATALE : Impossible de charger l'IA.\n{e}")
+    print(f"[❌] ERREUR FATALE : Impossible d'initialiser le backend d'inférence.\n{e}")
     exit()
 
 preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
 last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
 next_infer_ts_ms = None
 next_detect_ts_ms = None
+
+if INFER_WARMUP_RUNS > 0:
+    print(f"[⏳] Warmup backend inférence ({INFER_WARMUP_RUNS} runs)...")
+    inference_engine.warmup(input_shape=(1, 48, 48, 3), runs=INFER_WARMUP_RUNS)
 
 print("[⏳] Initialisation des capteurs géométriques...")
 base_options = python.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH)
@@ -454,10 +474,10 @@ try:
                             tensor = np.expand_dims(ai_input, axis=0)
 
                         with Timer(frame_timings.timings_ms, "infer"):
-                            raw_preds = emotion_model(tensor, training=False)[0].numpy()
-                            preds_buffer.append(raw_preds)
-                            last_prediction = np.mean(preds_buffer, axis=0)
+                            raw_preds = inference_engine.predict(tensor)
 
+                        preds_buffer.append(raw_preds)
+                        last_prediction = np.mean(preds_buffer, axis=0)
                         infer_ran = True
                         infer_count += 1
                         next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS

@@ -75,6 +75,21 @@ inference:
 ```
 - `inference.fps: 0` (ou `null`) désactive l’inférence (mode mesure pipeline sans IA).
 
+- Backend inférence (Keras ou TFLite CPU/XNNPACK):
+```yaml
+inference:
+  fps: 8.0
+  backend: keras          # keras | tflite
+  tflite_model_path: models/faceguard_fp32.tflite
+  tflite_num_threads: 4
+  warmup_runs: 3
+```
+
+- Export modèle Keras -> TFLite fp32:
+```bash
+python tools/export_tflite.py --in models/<model>.keras --out models/faceguard_fp32.tflite
+```
+
 - Tracking ROI (detect rarely, track often):
 ```yaml
 tracking:
