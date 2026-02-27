@@ -1,0 +1,63 @@
+models:
+  emotion_model_path: models/faceguard_best_model_Version_25-065Epochs.keras
+  face_landmarker_path: models/face_landmarker.task
+
+emotion:
+  classes:
+    - ANGRY
+    - CONTEMPT
+    - DISGUST
+    - FEAR
+    - HAPPY
+    - NEUTRAL
+    - SAD
+    - SURPRISE
+  preds_buffer_maxlen: 15
+
+camera:
+  index: 0
+  width: 1280
+  height: 720
+
+asymmetry:
+  threshold: 20
+
+threat:
+  angry_contempt_bonus: 60
+  fear_bonus: 30
+
+clahe:
+  clip_limit: 2.5
+  tile_grid_size: [8, 8]
+
+ui:
+  mode: full
+  window_name: FaceGuard V2.0 - Edition Industrielle
+
+runtime:
+  outdir: runs
+  max_seconds: null
+  metrics_filename: metrics.jsonl
+  video_filename: video.mp4
+
+inference:
+  fps: 8.0
+  backend: keras
+  tflite_model_path: models/faceguard_fp32.tflite
+  tflite_num_threads: 4
+  warmup_runs: 3
+
+work_frame:
+  enabled: true
+  width: 640
+  height: 360
+
+tracking:
+  enabled: true
+  max_faces: 2
+  ttl_ms: 2000
+  iou_match_threshold: 0.3
+  detect_every_ms: 400
+  detect_every_n_frames: 15
+  tracker_type: MOSSE
+  max_missed_frames: 30
