@@ -105,6 +105,15 @@ tracking:
 python main.py --fps-infer 2 --ui off --max-seconds 20
 ```
 
+
+## Pipeline multi-thread (FG-G3)
+- Deux threads :
+  - **Capture/UI** : lecture caméra/replay, affichage OpenCV, enregistrement vidéo.
+  - **Traitement** : MediaPipe/Tracker + preprocess + inférence + scoring + logs JSONL.
+- Queue bornée `maxsize=2` avec politique **drop oldest** (on jette la plus ancienne frame quand la queue est pleine) pour réduire la latence perçue.
+- En replay, l’horloge de traitement utilise `CAP_PROP_POS_MSEC` (fallback index/FPS si non disponible).
+- **Métrique `total`** dans le profiling = temps **total du thread traitement** par frame (aussi exposé comme `total_processing`).
+
 ## Record / Replay
 - Enregistrer une session:
 ```bash

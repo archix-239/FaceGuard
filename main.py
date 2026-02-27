@@ -3,13 +3,14 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.vision.drawing_utils import draw_landmarks as mp_draw_landmarks, DrawingSpec as MpDrawingSpec
-from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarksConnections
 import numpy as np
 from collections import deque
 import math
 import os
 import time
+import threading
+import queue
+from dataclasses import dataclass, field
 
 from faceguard.config import load_config
 from faceguard.profiling import Timer, FrameTimings, RunProfiler
@@ -58,25 +59,14 @@ def create_tracker(tracker_type: str):
 
     def ctor_list(name: str):
         if name == "MOSSE":
-            return [
-                lambda: cv2.TrackerMOSSE_create(),
-                lambda: cv2.legacy.TrackerMOSSE_create(),
-            ]
+            return [lambda: cv2.TrackerMOSSE_create(), lambda: cv2.legacy.TrackerMOSSE_create()]
         if name == "KCF":
-            return [
-                lambda: cv2.TrackerKCF_create(),
-                lambda: cv2.legacy.TrackerKCF_create(),
-            ]
+            return [lambda: cv2.TrackerKCF_create(), lambda: cv2.legacy.TrackerKCF_create()]
         if name == "CSRT":
-            return [
-                lambda: cv2.TrackerCSRT_create(),
-                lambda: cv2.legacy.TrackerCSRT_create(),
-            ]
+            return [lambda: cv2.TrackerCSRT_create(), lambda: cv2.legacy.TrackerCSRT_create()]
         return []
 
-    # Par défaut: MOSSE (léger) puis fallback KCF
     order = ["MOSSE", "KCF"] if t == "MOSSE" else [t]
-
     for name in order:
         for ctor in ctor_list(name):
             try:
@@ -84,6 +74,115 @@ def create_tracker(tracker_type: str):
             except Exception:
                 continue
     return None
+
+
+def get_head_pose(landmarks):
+    nose_tip, left_cheek, right_cheek = landmarks[1], landmarks[454], landmarks[234]
+    dist_left = abs(nose_tip.x - left_cheek.x)
+    dist_right = abs(right_cheek.x - nose_tip.x)
+    if dist_right == 0:
+        return "PROFIL"
+    ratio = dist_left / dist_right
+    if ratio > 2.0:
+        return "PROFIL_GAUCHE"
+    if ratio < 0.5:
+        return "PROFIL_DROIT"
+    return "FACE"
+
+
+def rotate_point(point, center, angle_rad):
+    x, y, cx, cy = point[0], point[1], center[0], center[1]
+    new_x = cx + (x - cx) * math.cos(angle_rad) - (y - cy) * math.sin(angle_rad)
+    new_y = cy + (x - cx) * math.sin(angle_rad) + (y - cy) * math.cos(angle_rad)
+    return new_x, new_y
+
+
+def calculate_global_asymmetry(landmarks, w, h, symmetry_pairs):
+    total_deviation = 0
+    eye_l = (landmarks[33].x * w, landmarks[33].y * h)
+    eye_r = (landmarks[263].x * w, landmarks[263].y * h)
+
+    delta_x, delta_y = eye_r[0] - eye_l[0], eye_r[1] - eye_l[1]
+    angle_rad = math.atan2(delta_y, delta_x)
+    nose_pivot = (landmarks[1].x * w, landmarks[1].y * h)
+    eye_dist = math.sqrt(delta_x**2 + delta_y**2)
+    if eye_dist == 0:
+        return 0
+
+    for (idx_l, idx_r) in symmetry_pairs:
+        pl_raw = (landmarks[idx_l].x * w, landmarks[idx_l].y * h)
+        pr_raw = (landmarks[idx_r].x * w, landmarks[idx_r].y * h)
+        pl = rotate_point(pl_raw, nose_pivot, -angle_rad)
+        pr = rotate_point(pr_raw, nose_pivot, -angle_rad)
+
+        height_diff = abs(pl[1] - pr[1])
+        dist_l_x = abs(pl[0] - nose_pivot[0])
+        dist_r_x = abs(pr[0] - nose_pivot[0])
+        width_diff = abs(dist_l_x - dist_r_x)
+
+        local_score = (width_diff + (height_diff * 1.5)) / eye_dist
+        total_deviation += local_score
+
+    return (total_deviation / len(symmetry_pairs)) * 100
+
+
+def draw_transparent_box(image, x, y, w, h, alpha=0.6):
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), (30, 30, 30), -1)
+    return cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+
+
+@dataclass
+class OverlayState:
+    frame_idx: int = -1
+    has_face: bool = False
+    bbox: tuple[int, int, int, int] | None = None
+    dom_emo: str = "SCANNING..."
+    threat_score: int = 0
+    pose_text: str = "INCONNU"
+    valid_quality: bool = False
+    infer_ran: bool = False
+    detect_ran: bool = False
+    track_ok: bool = False
+    last_prediction: np.ndarray = field(default_factory=lambda: np.zeros(8, dtype=np.float32))
+    is_asymmetric: bool = False
+
+
+class SharedState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.overlay = OverlayState()
+        self.infer_count = 0
+        self.capture_loop_ms: list[float] = []
+
+    def update_overlay(self, overlay: OverlayState):
+        with self._lock:
+            self.overlay = overlay
+
+    def get_overlay(self) -> OverlayState:
+        with self._lock:
+            return OverlayState(
+                frame_idx=self.overlay.frame_idx,
+                has_face=self.overlay.has_face,
+                bbox=self.overlay.bbox,
+                dom_emo=self.overlay.dom_emo,
+                threat_score=self.overlay.threat_score,
+                pose_text=self.overlay.pose_text,
+                valid_quality=self.overlay.valid_quality,
+                infer_ran=self.overlay.infer_ran,
+                detect_ran=self.overlay.detect_ran,
+                track_ok=self.overlay.track_ok,
+                last_prediction=np.array(self.overlay.last_prediction, copy=True),
+                is_asymmetric=self.overlay.is_asymmetric,
+            )
+
+    def inc_infer_count(self):
+        with self._lock:
+            self.infer_count += 1
+
+    def get_infer_count(self) -> int:
+        with self._lock:
+            return self.infer_count
 
 
 print("\n" + "=" * 50)
@@ -114,6 +213,7 @@ EMOTION_CLASSES = config["emotion"]["classes"]
 WORK_FRAME_ENABLED = bool(config.get("work_frame", {}).get("enabled", False))
 WORK_FRAME_WIDTH = int(config.get("work_frame", {}).get("width", 640))
 WORK_FRAME_HEIGHT = int(config.get("work_frame", {}).get("height", 360))
+
 inference_cfg = config.get("inference", {})
 infer_cfg_fps = args.fps_infer if args.fps_infer is not None else inference_cfg.get("fps", 8.0)
 INFER_FPS = float(infer_cfg_fps) if infer_cfg_fps is not None else 0.0
@@ -150,13 +250,7 @@ try:
         f"output(shape={engine_details.output_shape}, dtype={engine_details.output_dtype})"
     )
 except Exception as e:
-    print(f"[❌] ERREUR FATALE : Impossible d'initialiser le backend d'inférence.\n{e}")
-    exit()
-
-preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
-last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
-next_infer_ts_ms = None
-next_detect_ts_ms = None
+    raise SystemExit(f"[❌] ERREUR FATALE : Impossible d'initialiser le backend d'inférence.\n{e}")
 
 if INFER_WARMUP_RUNS > 0:
     print(f"[⏳] Warmup backend inférence ({INFER_WARMUP_RUNS} runs)...")
@@ -177,63 +271,6 @@ SYMMETRY_PAIRS = [
     (159, 386), (240, 460), (61, 291), (37, 267), (17, 314), (58, 288), (172, 397)
 ]
 
-
-def get_head_pose(landmarks):
-    nose_tip, left_cheek, right_cheek = landmarks[1], landmarks[454], landmarks[234]
-    dist_left = abs(nose_tip.x - left_cheek.x)
-    dist_right = abs(right_cheek.x - nose_tip.x)
-    if dist_right == 0:
-        return "PROFIL"
-    ratio = dist_left / dist_right
-    if ratio > 2.0:
-        return "PROFIL_GAUCHE"
-    elif ratio < 0.5:
-        return "PROFIL_DROIT"
-    return "FACE"
-
-
-def rotate_point(point, center, angle_rad):
-    x, y, cx, cy = point[0], point[1], center[0], center[1]
-    new_x = cx + (x - cx) * math.cos(angle_rad) - (y - cy) * math.sin(angle_rad)
-    new_y = cy + (x - cx) * math.sin(angle_rad) + (y - cy) * math.cos(angle_rad)
-    return new_x, new_y
-
-
-def calculate_global_asymmetry(landmarks, w, h):
-    total_deviation = 0
-    eye_l = (landmarks[33].x * w, landmarks[33].y * h)
-    eye_r = (landmarks[263].x * w, landmarks[263].y * h)
-
-    delta_x, delta_y = eye_r[0] - eye_l[0], eye_r[1] - eye_l[1]
-    angle_rad = math.atan2(delta_y, delta_x)
-    nose_pivot = (landmarks[1].x * w, landmarks[1].y * h)
-    eye_dist = math.sqrt(delta_x**2 + delta_y**2)
-    if eye_dist == 0:
-        return 0
-
-    for (idx_l, idx_r) in SYMMETRY_PAIRS:
-        pl_raw = (landmarks[idx_l].x * w, landmarks[idx_l].y * h)
-        pr_raw = (landmarks[idx_r].x * w, landmarks[idx_r].y * h)
-        pl = rotate_point(pl_raw, nose_pivot, -angle_rad)
-        pr = rotate_point(pr_raw, nose_pivot, -angle_rad)
-
-        height_diff = abs(pl[1] - pr[1])
-        dist_l_x = abs(pl[0] - nose_pivot[0])
-        dist_r_x = abs(pr[0] - nose_pivot[0])
-        width_diff = abs(dist_l_x - dist_r_x)
-
-        local_score = (width_diff + (height_diff * 1.5)) / eye_dist
-        total_deviation += local_score
-
-    return (total_deviation / len(SYMMETRY_PAIRS)) * 100
-
-
-def draw_transparent_box(image, x, y, w, h, alpha=0.6):
-    overlay = image.copy()
-    cv2.rectangle(overlay, (x, y), (x + w, y + h), (30, 30, 30), -1)
-    return cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
-
-
 input_source = args.replay if args.replay else int(config["camera"]["index"])
 max_seconds = args.max_seconds if args.max_seconds is not None else config["runtime"].get("max_seconds")
 max_seconds = float(max_seconds) if max_seconds is not None else None
@@ -249,45 +286,93 @@ if args.replay and (not replay_fps or replay_fps <= 0):
     replay_fps = 30.0
 
 profiler = RunProfiler(output_path=metrics_path)
-frame_idx = 0
+frame_queue: queue.Queue[tuple[int, int, float, float, np.ndarray]] = queue.Queue(maxsize=2)
+shared_state = SharedState()
+stop_event = threading.Event()
 writer = None
-run_start = time.perf_counter()
 interrupted = False
-infer_count = 0
+run_start = time.perf_counter()
 
-tracker = None
-tracked_bbox = None
-last_landmarks = None
-missed_frames = 0
-last_track_ok = False
 
-try:
-    while cap.isOpened():
-        if max_seconds is not None and (time.perf_counter() - run_start) >= max_seconds:
-            print(f"[ℹ️] Durée max atteinte ({max_seconds:.2f}s). Arrêt propre.")
-            break
+def render_overlay(frame_raw: np.ndarray, overlay: OverlayState):
+    frame_vis = frame_raw.copy()
+    img_h, img_w, _ = frame_vis.shape
+    bbox = overlay.bbox
+    if ui_mode in ("full", "min") and bbox is not None:
+        x_min, y_min, x_max, y_max = bbox
+        cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
+
+    if ui_mode == "full":
+        if bbox is not None and overlay.last_prediction.size > 0:
+            x_min, y_min, x_max, y_max = bbox
+            display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
+            forehead_x = x_min + (x_max - x_min) // 2
+            forehead_y = y_min
+            box_right_x = min(x_max + 30, img_w - 200)
+            box_right_y = max(30, y_min - 20)
+            cv2.line(frame_vis, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
+            frame_vis = draw_transparent_box(frame_vis, box_right_x, box_right_y, 200, 180, alpha=0.5)
+            y_offset = box_right_y + 20
+            for emo in display_order:
+                idx = EMOTION_CLASSES.index(emo)
+                score = overlay.last_prediction[idx] * 100
+                thickness = 2 if emo == overlay.dom_emo else 1
+                color = (255, 255, 255) if emo == overlay.dom_emo else (180, 180, 180)
+                cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
+                y_offset += 20
+
+            box_left_x = max(10, x_min - 220)
+            box_left_y = max(30, y_min + 50)
+            ts_color = (0, 255, 0)
+            if overlay.threat_score >= 40:
+                ts_color = (0, 165, 255)
+            if overlay.threat_score >= 70:
+                ts_color = (0, 0, 255)
+            frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
+            cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
+            cv2.putText(frame_vis, f"{overlay.dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame_vis, f"THREAT SCORE: {overlay.threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
+            if overlay.is_asymmetric:
+                cv2.putText(frame_vis, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+
+        if overlay.threat_score >= 70:
+            cv2.rectangle(frame_vis, (0, 0), (img_w, img_h), (0, 0, 255), 4)
+            cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w // 2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+    elif ui_mode == "min":
+        cv2.putText(frame_vis, f"EMO: {overlay.dom_emo}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"THREAT: {overlay.threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"POSE: {overlay.pose_text}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"INFER_OK: {overlay.valid_quality}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"INFER_RAN: {overlay.infer_ran}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"TRACK: {'ok' if overlay.track_ok else 'failed'}", (20, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"DETECT: {'ran' if overlay.detect_ran else 'not'}", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    return frame_vis
+
+
+def processing_loop():
+    preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
+    last_prediction = np.zeros(len(EMOTION_CLASSES), dtype=np.float32)
+    next_infer_ts_ms = None
+    next_detect_ts_ms = None
+    tracker = None
+    tracked_bbox = None
+    missed_frames = 0
+    last_track_ok = False
+
+    while not stop_event.is_set() or not frame_queue.empty():
+        try:
+            frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw = frame_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
 
         frame_start = time.perf_counter()
-        frame_ts_ms = int(time.time() * 1000)
         frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
-        frame_idx += 1
+        frame_timings.timings_ms["capture"] = capture_ms
 
-        with Timer(frame_timings.timings_ms, "capture"):
-            success, frame_raw = cap.read()
-            if success and not args.replay:
-                frame_raw = cv2.flip(frame_raw, 1)
-
-        if not success:
-            break
-
-        if args.replay:
-            # Horloge replay fiable basée sur index frame/FPS vidéo
-            clock_ts_ms = (frame_timings.frame_idx / replay_fps) * 1000.0
-        else:
-            clock_ts_ms = time.time() * 1000.0
-
-        frame_vis = frame_raw.copy()
-        img_h, img_w, _ = frame_raw.shape
+        frame_vis = frame_raw
+        img_h, img_w, _ = frame_vis.shape
 
         if WORK_FRAME_ENABLED:
             work_frame = cv2.resize(frame_raw, (WORK_FRAME_WIDTH, WORK_FRAME_HEIGHT))
@@ -297,13 +382,6 @@ try:
         work_h, work_w, _ = work_frame.shape
         scale_x = img_w / work_w
         scale_y = img_h / work_h
-
-        if args.record and writer is None:
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if not fps or fps <= 0:
-                fps = 30.0
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
 
         detect_ran = False
         tracker_ran = False
@@ -366,7 +444,6 @@ try:
 
                 if res.face_landmarks:
                     landmarks = res.face_landmarks[0]
-                    last_landmarks = landmarks
                     x_vals = [l.x for l in landmarks]
                     y_vals = [l.y for l in landmarks]
                     x_min_w, x_max_w = max(0, int(min(x_vals) * work_w) - 10), min(work_w, int(max(x_vals) * work_w) + 10)
@@ -404,7 +481,6 @@ try:
 
             if res.face_landmarks:
                 landmarks = res.face_landmarks[0]
-                last_landmarks = landmarks
                 x_vals = [l.x for l in landmarks]
                 y_vals = [l.y for l in landmarks]
                 x_min_w, x_max_w = max(0, int(min(x_vals) * work_w) - 10), min(work_w, int(max(x_vals) * work_w) + 10)
@@ -425,6 +501,7 @@ try:
                 track_ok = False
                 missed_frames += 1
             last_track_ok = False
+
         threat_score = 0
         dom_emo = "SCANNING..."
         activation = 0.0
@@ -441,16 +518,14 @@ try:
 
         frame_timings.has_face = roi_bbox is not None
 
-        # Géométrie/asymétrie uniquement quand landmarks disponibles (frames de détection)
         if landmarks is not None:
             pose_text = get_head_pose(landmarks)
             if pose_text == "FACE":
-                asym_score = calculate_global_asymmetry(landmarks, work_w, work_h)
+                asym_score = calculate_global_asymmetry(landmarks, work_w, work_h, SYMMETRY_PAIRS)
                 if asym_score > float(config["asymmetry"]["threshold"]):
                     is_asymmetric = True
                     threat_score += 40
 
-        # Préprocess + inférence via bbox (détection ou tracking)
         if roi_bbox is not None:
             x_min_w = max(0, min(work_w - 1, int(x_min / scale_x)))
             x_max_w = max(0, min(work_w, int(x_max / scale_x)))
@@ -461,7 +536,6 @@ try:
                 if INFER_ENABLED:
                     if next_infer_ts_ms is None:
                         next_infer_ts_ms = clock_ts_ms
-
                     should_infer = clock_ts_ms >= next_infer_ts_ms
                     if should_infer:
                         with Timer(frame_timings.timings_ms, "preprocess"):
@@ -469,7 +543,6 @@ try:
                             gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
                             clahe_img = clahe.apply(gray)
                             final_input = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2RGB)
-
                             ai_input = cv2.resize(final_input, (48, 48))
                             tensor = np.expand_dims(ai_input, axis=0)
 
@@ -479,102 +552,22 @@ try:
                         preds_buffer.append(raw_preds)
                         last_prediction = np.mean(preds_buffer, axis=0)
                         infer_ran = True
-                        infer_count += 1
+                        shared_state.inc_infer_count()
                         next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS
 
                     valid_quality = True
-                else:
-                    valid_quality = False
 
             if len(preds_buffer) > 0:
                 top_2_idx = last_prediction.argsort()[-2:][::-1]
                 dom_emo = EMOTION_CLASSES[top_2_idx[0]]
                 activation = last_prediction[top_2_idx[0]] * 100
-
                 if dom_emo in ['ANGRY', 'CONTEMPT']:
                     threat_score += int(config["threat"]["angry_contempt_bonus"])
                 if dom_emo in ['FEAR']:
                     threat_score += int(config["threat"]["fear_bonus"])
 
-        with Timer(frame_timings.timings_ms, "ui"):
-            if ui_mode == "full":
-                if landmarks is not None:
-                    mp_draw_landmarks(
-                        image=frame_vis,
-                        landmark_list=landmarks,
-                        connections=FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
-                        landmark_drawing_spec=None,
-                        connection_drawing_spec=MpDrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0),
-                    )
-
-                if roi_bbox is not None:
-                    cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
-
-                if roi_bbox is not None and len(preds_buffer) > 0:
-                    forehead_x = x_min + (x_max - x_min) // 2
-                    forehead_y = y_min
-                    box_right_x = min(x_max + 30, img_w - 200)
-                    box_right_y = max(30, y_min - 20)
-                    cv2.line(frame_vis, (forehead_x, forehead_y), (box_right_x, box_right_y), (255, 255, 255), 1)
-
-                    display_order = ['NEUTRAL', 'HAPPY', 'SURPRISE', 'ANGRY', 'DISGUST', 'FEAR', 'SAD', 'CONTEMPT']
-                    frame_vis = draw_transparent_box(frame_vis, box_right_x, box_right_y, 200, 180, alpha=0.5)
-
-                    y_offset = box_right_y + 20
-                    for emo in display_order:
-                        idx = EMOTION_CLASSES.index(emo)
-                        score = last_prediction[idx] * 100
-                        thickness = 2 if emo == dom_emo else 1
-                        color = (255, 255, 255) if emo == dom_emo else (180, 180, 180)
-                        cv2.putText(frame_vis, f"{emo:<10} {score:5.2f}%", (box_right_x + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, thickness)
-                        y_offset += 20
-
-                    box_left_x = max(10, x_min - 220)
-                    box_left_y = max(30, y_min + 50)
-
-                    ts_color = (0, 255, 0)
-                    if threat_score >= 40:
-                        ts_color = (0, 165, 255)
-                    if threat_score >= 70:
-                        ts_color = (0, 0, 255)
-
-                    frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
-                    cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
-
-                    cv2.putText(frame_vis, f"{dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.putText(frame_vis, f"THREAT SCORE: {threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
-
-                    if is_asymmetric:
-                        cv2.putText(frame_vis, "⚠️ ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
-
-                if threat_score >= 70:
-                    cv2.rectangle(frame_vis, (0, 0), (img_w, img_h), (0, 0, 255), 4)
-                    cv2.putText(frame_vis, "INTENTION HOSTILE DETECTEE", (img_w // 2 - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-
-                cv2.imshow(config["ui"]["window_name"], frame_vis)
-                should_quit = (cv2.waitKey(5) & 0xFF == 27)
-
-            elif ui_mode == "min":
-                if roi_bbox is not None:
-                    cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"EMO: {dom_emo}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"THREAT: {threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"POSE: {pose_text}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"INFER_OK: {valid_quality}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"INFER_RAN: {infer_ran}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"TRACK: {'ok' if track_ok else 'failed'}", (20, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(frame_vis, f"DETECT: {'ran' if detect_ran else 'not'}", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-                cv2.imshow(config["ui"]["window_name"], frame_vis)
-                should_quit = (cv2.waitKey(5) & 0xFF == 27)
-
-            else:  # off
-                should_quit = False
-
-        if writer is not None:
-            writer.write(frame_vis if args.record_overlay else frame_raw)
-
         frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
+        frame_timings.timings_ms["total_processing"] = frame_timings.timings_ms["total"]
         frame_timings.pose = pose_text
         frame_timings.valid_quality = valid_quality
         frame_timings.infer_ran = infer_ran
@@ -589,13 +582,120 @@ try:
         frame_timings.threat_score = int(threat_score)
         profiler.write_frame(frame_timings)
 
-        if should_quit:
+        overlay_bbox = (x_min, y_min, x_max, y_max) if roi_bbox is not None else None
+        shared_state.update_overlay(
+            OverlayState(
+                frame_idx=frame_idx,
+                has_face=roi_bbox is not None,
+                bbox=overlay_bbox,
+                dom_emo=dom_emo,
+                threat_score=int(threat_score),
+                pose_text=pose_text,
+                valid_quality=valid_quality,
+                infer_ran=infer_ran,
+                detect_ran=detect_ran,
+                track_ok=track_ok,
+                last_prediction=np.array(last_prediction, copy=True),
+                is_asymmetric=is_asymmetric,
+            )
+        )
+
+
+def capture_loop():
+    nonlocal_writer = {"writer": None}
+    frame_idx = 0
+
+    while cap.isOpened() and not stop_event.is_set():
+        capture_loop_start = time.perf_counter()
+        if max_seconds is not None and (time.perf_counter() - run_start) >= max_seconds:
+            print(f"[ℹ️] Durée max atteinte ({max_seconds:.2f}s). Arrêt propre.")
+            stop_event.set()
+            break
+
+        cap_t0 = time.perf_counter()
+        success, frame_raw = cap.read()
+        capture_ms = (time.perf_counter() - cap_t0) * 1000.0
+        if not success:
+            stop_event.set()
+            break
+
+        if not args.replay:
+            frame_raw = cv2.flip(frame_raw, 1)
+
+        frame_ts_ms = int(time.time() * 1000)
+        if args.replay:
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if pos_msec and pos_msec > 0:
+                clock_ts_ms = float(pos_msec)
+            else:
+                clock_ts_ms = (frame_idx / replay_fps) * 1000.0
+        else:
+            clock_ts_ms = time.time() * 1000.0
+
+        try:
+            frame_queue.put_nowait((frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw.copy()))
+        except queue.Full:
+            # Politique: drop oldest pour conserver la frame la plus récente et minimiser la latence UI.
+            try:
+                _ = frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            frame_queue.put_nowait((frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw.copy()))
+
+        overlay = shared_state.get_overlay()
+        frame_vis = render_overlay(frame_raw, overlay)
+
+        if args.record:
+            if nonlocal_writer["writer"] is None:
+                img_h, img_w, _ = frame_raw.shape
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if not fps or fps <= 0:
+                    fps = 30.0
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                nonlocal_writer["writer"] = cv2.VideoWriter(video_path, fourcc, fps, (img_w, img_h))
+            nonlocal_writer["writer"].write(frame_vis if args.record_overlay else frame_raw)
+
+        if ui_mode != "off":
+            cv2.imshow(config["ui"]["window_name"], frame_vis)
+            if (cv2.waitKey(1) & 0xFF) == 27:
+                stop_event.set()
+                break
+
+        frame_idx += 1
+        shared_state.capture_loop_ms.append((time.perf_counter() - capture_loop_start) * 1000.0)
+
+    writer_obj = nonlocal_writer["writer"]
+    return writer_obj
+
+
+writer_holder = {"writer": None}
+
+
+def capture_runner():
+    writer_holder["writer"] = capture_loop()
+
+
+processing_thread = threading.Thread(target=processing_loop, name="processing", daemon=True)
+capture_thread = threading.Thread(target=capture_runner, name="capture_ui", daemon=True)
+
+try:
+    processing_thread.start()
+    capture_thread.start()
+
+    while capture_thread.is_alive() or processing_thread.is_alive():
+        time.sleep(0.05)
+        if stop_event.is_set() and not capture_thread.is_alive():
             break
 except KeyboardInterrupt:
     interrupted = True
     print("\n[ℹ️] Interruption clavier reçue (CTRL-C). Arrêt propre en cours...")
+    stop_event.set()
 finally:
+    stop_event.set()
+    capture_thread.join(timeout=3.0)
+    processing_thread.join(timeout=5.0)
     cap.release()
+    writer = writer_holder["writer"]
     if writer is not None:
         writer.release()
     if ui_mode != "off":
@@ -604,11 +704,12 @@ finally:
     profiler.close()
 
 run_duration_sec = max(time.perf_counter() - run_start, 1e-9)
+infer_count = shared_state.get_infer_count()
 effective_infer_fps = infer_count / run_duration_sec
 
 print(f"[✅] Run ID: {run_id}")
 print(f"[✅] Metrics: {metrics_path}")
-if writer is not None:
+if writer_holder["writer"] is not None:
     mode = "overlay" if args.record_overlay else "raw"
     print(f"[✅] Video: {video_path} ({mode})")
 if interrupted:

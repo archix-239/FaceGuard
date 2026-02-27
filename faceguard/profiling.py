@@ -34,15 +34,12 @@ class FrameTimings:
     pose: str = "INCONNU"
     valid_quality: bool = False
     infer_ran: bool = False
-<<<<<<< HEAD
-=======
     detect_ran: bool = False
     tracker_ran: bool = False
     track_ok: bool = False
     need_detect_reason: str = ""
     detect_every_ms: float | None = None
     bbox: list[int] | None = None
->>>>>>> codex/map-architecture-and-propose-refactor-plan-9olq6a
     timings_ms: Dict[str, float] = field(default_factory=dict)
     emotion_top1: str = "SCANNING..."
     emotion_p: float = 0.0
@@ -56,15 +53,12 @@ class FrameTimings:
             "pose": self.pose,
             "valid_quality": self.valid_quality,
             "infer_ran": self.infer_ran,
-<<<<<<< HEAD
-=======
             "detect_ran": self.detect_ran,
             "tracker_ran": self.tracker_ran,
             "track_ok": self.track_ok,
             "need_detect_reason": self.need_detect_reason,
             "detect_every_ms": self.detect_every_ms,
             "bbox": self.bbox,
->>>>>>> codex/map-architecture-and-propose-refactor-plan-9olq6a
             "timings_ms": self.timings_ms,
             "emotion_top1": self.emotion_top1,
             "emotion_p": self.emotion_p,
@@ -94,10 +88,7 @@ class RunProfiler:
         self._stats: Dict[str, List[float]] = {
             "capture": [],
             "mediapipe": [],
-<<<<<<< HEAD
-=======
             "tracker": [],
->>>>>>> codex/map-architecture-and-propose-refactor-plan-9olq6a
             "preprocess": [],
             "infer": [],
             "ui": [],
@@ -138,12 +129,9 @@ class RunProfiler:
     def print_summary(self):
         print("\n" + "=" * 50)
         print("📊 PROFILING SUMMARY")
+        print("(note: total = total_processing thread)")
         print(f"JSONL: {self.path}")
-<<<<<<< HEAD
-        for stage in ["capture", "mediapipe", "preprocess", "infer", "ui", "total"]:
-=======
         for stage in ["capture", "mediapipe", "tracker", "preprocess", "infer", "ui", "total"]:
->>>>>>> codex/map-architecture-and-propose-refactor-plan-9olq6a
             print(f"- {stage:10s}: {self._fmt_percentiles(self._stats[stage])}")
 
         totals = self._stats["total"]
