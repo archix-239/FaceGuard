@@ -40,6 +40,7 @@ class FrameTimings:
     tracker_ran: bool = False
     track_ok: bool = False
     need_detect_reason: str = ""
+    detect_every_ms: float | None = None
     bbox: list[int] | None = None
 >>>>>>> codex/map-architecture-and-propose-refactor-plan-9olq6a
     timings_ms: Dict[str, float] = field(default_factory=dict)
@@ -61,6 +62,7 @@ class FrameTimings:
             "tracker_ran": self.tracker_ran,
             "track_ok": self.track_ok,
             "need_detect_reason": self.need_detect_reason,
+            "detect_every_ms": self.detect_every_ms,
             "bbox": self.bbox,
 >>>>>>> codex/map-architecture-and-propose-refactor-plan-9olq6a
             "timings_ms": self.timings_ms,

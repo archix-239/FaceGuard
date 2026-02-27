@@ -79,7 +79,8 @@ inference:
 ```yaml
 tracking:
   enabled: true
-  detect_every_n_frames: 15
+  detect_every_ms: 400      # prioritaire si > 0
+  detect_every_n_frames: 15 # fallback si detect_every_ms absent/null/<=0
   tracker_type: MOSSE
   max_missed_frames: 30
 ```
