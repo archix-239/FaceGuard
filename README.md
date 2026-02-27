@@ -122,7 +122,10 @@ python main.py --fps-infer 2 --ui off --max-seconds 20
 - Deux threads :
   - **Capture/UI** : lecture caméra/replay, affichage OpenCV, enregistrement vidéo.
   - **Traitement** : MediaPipe/Tracker + preprocess + inférence + scoring + logs JSONL.
-- Queue bornée `maxsize=2` avec politique **drop oldest** (on jette la plus ancienne frame quand la queue est pleine) pour réduire la latence perçue.
+- Queue bornée configurable (`runtime.queue_maxsize`, défaut 8) avec politique configurable (`runtime.queue_drop_policy`).
+  - Recommandé tracking temps réel: `drop_newest` (conserve la continuité des frames déjà en queue).
+  - Option `block` possible en `ui off` pour ralentir la capture au lieu de jeter.
+- Quand backlog > 1 et tracking actif, le processing draine les frames intermédiaires en **track-only** (tracker.update uniquement, sans detect/infer), puis exécute le pipeline normal sur la dernière frame.
 - En replay, l’horloge de traitement utilise `CAP_PROP_POS_MSEC` (fallback index/FPS si non disponible).
 - **Métrique `total`** dans le profiling = temps **total du thread traitement** par frame (aussi exposé comme `total_processing`).
 

@@ -44,6 +44,11 @@ def _apply_path_resolution(config: Dict[str, Any]) -> Dict[str, Any]:
     tracking_cfg.setdefault("iou_match_threshold", 0.2)
     tracking_cfg.setdefault("centroid_match_threshold", 0.15)
     out["tracking"] = tracking_cfg
+
+    runtime_cfg = out.get("runtime", {})
+    runtime_cfg.setdefault("queue_maxsize", 8)
+    runtime_cfg.setdefault("queue_drop_policy", "drop_newest")
+    out["runtime"] = runtime_cfg
     return out
 
 

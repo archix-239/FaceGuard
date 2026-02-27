@@ -350,10 +350,11 @@ ui_mode = "off" if args.no_ui else (args.ui if args.ui else config_ui_mode)
 if ui_mode not in UI_MODES:
     raise SystemExit(f"❌ Mode UI invalide: {ui_mode}. Valeurs supportées: {', '.join(UI_MODES)}")
 
-run_outdir = args.outdir if args.outdir else config["runtime"]["outdir"]
+runtime_cfg = config.get("runtime", {})
+run_outdir = args.outdir if args.outdir else runtime_cfg["outdir"]
 run_id, run_dir = create_run_dir(run_outdir, args.replay)
-metrics_path = os.path.join(run_dir, config["runtime"]["metrics_filename"])
-video_path = os.path.join(run_dir, config["runtime"]["video_filename"])
+metrics_path = os.path.join(run_dir, runtime_cfg["metrics_filename"])
+video_path = os.path.join(run_dir, runtime_cfg["video_filename"])
 
 MODEL_PATH = config["models"]["emotion_model_path"]
 FACE_LANDMARKER_PATH = config["models"]["face_landmarker_path"]
@@ -425,7 +426,11 @@ SYMMETRY_PAIRS = [
 ]
 
 input_source = args.replay if args.replay else int(config["camera"]["index"])
-max_seconds = args.max_seconds if args.max_seconds is not None else config["runtime"].get("max_seconds")
+QUEUE_MAXSIZE = max(1, int(runtime_cfg.get("queue_maxsize", 8)))
+QUEUE_DROP_POLICY = str(runtime_cfg.get("queue_drop_policy", "drop_newest")).lower()
+if QUEUE_DROP_POLICY not in ("drop_newest", "drop_oldest", "block"):
+    QUEUE_DROP_POLICY = "drop_newest"
+max_seconds = args.max_seconds if args.max_seconds is not None else runtime_cfg.get("max_seconds")
 max_seconds = float(max_seconds) if max_seconds is not None else None
 
 print("[✅] Démarrage de la caméra... (Appuyez sur ECHAP pour quitter)" if not args.replay else f"[✅] Replay vidéo: {args.replay}")
@@ -439,7 +444,7 @@ if args.replay and (not replay_fps or replay_fps <= 0):
     replay_fps = 30.0
 
 profiler = RunProfiler(output_path=metrics_path)
-frame_queue: queue.Queue[tuple[int, int, int, float, np.ndarray]] = queue.Queue(maxsize=2)
+frame_queue: queue.Queue[tuple[int, int, int, float, np.ndarray]] = queue.Queue(maxsize=QUEUE_MAXSIZE)
 shared_state = SharedState()
 stop_event = threading.Event()
 writer = None
@@ -478,6 +483,101 @@ def render_overlay(frame_raw: np.ndarray, overlay: OverlayState):
     return frame_vis
 
 
+
+
+def process_backlog_track_only_frame(
+    frame_ts_ms: int,
+    frame_idx: int,
+    clock_ts_ms: int,
+    capture_ms: float,
+    frame_raw: np.ndarray,
+    people: dict[int, PersonState],
+):
+    frame_start = time.perf_counter()
+    frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
+    frame_timings.timings_ms["capture"] = capture_ms
+
+    img_h, img_w, _ = frame_raw.shape
+    tracker_ran = False
+
+    expired_ids = [pid for pid, p in people.items() if (clock_ts_ms - p.last_seen_ts_ms) > TTL_MS]
+    for pid in expired_ids:
+        people.pop(pid, None)
+
+    for person in list(people.values()):
+        if person.tracker is None:
+            person.track_ok = False
+            person.missed_frames += 1
+            continue
+        with Timer(frame_timings.timings_ms, "tracker"):
+            ok, bbox = person.tracker.update(frame_raw)
+        tracker_ran = True
+        if ok:
+            x, y, w, h = clip_bbox_xywh(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), img_w, img_h)
+            person.bbox_xywh = smooth_bbox_xywh(person.bbox_xywh, (x, y, w, h), BBOX_SMOOTH_ALPHA, img_w, img_h)
+            person.track_ok = True
+            person.last_seen_ts_ms = clock_ts_ms
+            person.missed_frames = 0
+        else:
+            person.track_ok = False
+            person.missed_frames += 1
+            if person.missed_frames > MAX_MISSED_FRAMES:
+                person.tracker = None
+
+    people_payload = []
+    overlays: list[PersonOverlay] = []
+    for person_id in sorted(list(people.keys())):
+        person = people[person_id]
+        x, y, w, h = person.bbox_xywh
+        people_payload.append(
+            {
+                "id": int(person.person_id),
+                "bbox": list(person.bbox_xywh),
+                "track_ok": bool(person.track_ok),
+                "threat_score": int(person.threat_score),
+                "emotion_top1": person.dom_emo,
+                "emotion_p": float(person.activation / 100.0),
+                "infer_ran": False,
+                "valid_quality": bool(person.valid_quality),
+            }
+        )
+        overlays.append(
+            PersonOverlay(
+                person_id=int(person.person_id),
+                bbox=(x, y, x + w, y + h),
+                threat_score=int(person.threat_score),
+                dom_emo=person.dom_emo,
+                pose_text=person.pose_text,
+                valid_quality=person.valid_quality,
+                infer_ran=False,
+                track_ok=person.track_ok,
+                detect_ran=False,
+                activation=float(person.activation),
+            )
+        )
+
+    frame_timings.timings_ms["total"] = (time.perf_counter() - frame_start) * 1000.0
+    frame_timings.timings_ms["total_processing"] = frame_timings.timings_ms["total"]
+    frame_timings.has_face = len(people) > 0
+    frame_timings.detect_ran = False
+    frame_timings.tracker_ran = tracker_ran
+    frame_timings.track_ok = any(p.track_ok for p in people.values())
+    frame_timings.need_detect_reason = "backlog_track_only"
+    frame_timings.detect_every_ms = DETECT_EVERY_MS
+    frame_timings.infer_ran = False
+    frame_timings.people = people_payload
+    if overlays:
+        top_person = max(overlays, key=lambda p: p.threat_score)
+        frame_timings.bbox = list(people[top_person.person_id].bbox_xywh)
+        frame_timings.pose = top_person.pose_text
+        frame_timings.valid_quality = top_person.valid_quality
+        frame_timings.emotion_top1 = top_person.dom_emo
+        frame_timings.emotion_p = top_person.activation / 100.0
+        frame_timings.threat_score = top_person.threat_score
+
+    profiler.write_frame(frame_timings)
+    shared_state.update_overlay(OverlayState(frame_idx=frame_idx, detect_ran=False, people=overlays))
+
 def processing_loop():
     people: dict[int, PersonState] = {}
     next_person_id = 1
@@ -489,6 +589,22 @@ def processing_loop():
             shared_state.update_source_clock(clock_ts_ms)
         except queue.Empty:
             continue
+
+        if TRACKING_ENABLED and len(people) > 0:
+            while frame_queue.qsize() > 1:
+                try:
+                    fast_ts_ms, fast_idx, fast_clock_ts_ms, fast_capture_ms, fast_frame_raw = frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+                shared_state.update_source_clock(fast_clock_ts_ms)
+                process_backlog_track_only_frame(
+                    frame_ts_ms=fast_ts_ms,
+                    frame_idx=fast_idx,
+                    clock_ts_ms=fast_clock_ts_ms,
+                    capture_ms=fast_capture_ms,
+                    frame_raw=fast_frame_raw,
+                    people=people,
+                )
 
         frame_start = time.perf_counter()
         frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
@@ -764,15 +880,25 @@ def capture_loop():
         else:
             clock_ts_ms = int(time.time() * 1000.0)
 
+        payload = (frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw.copy())
         try:
-            frame_queue.put_nowait((frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw.copy()))
+            if QUEUE_DROP_POLICY == "block" and ui_mode == "off":
+                frame_queue.put(payload, timeout=0.05)
+            else:
+                frame_queue.put_nowait(payload)
         except queue.Full:
-            # Politique: drop oldest pour conserver la frame la plus récente et minimiser la latence UI.
-            try:
-                _ = frame_queue.get_nowait()
-            except queue.Empty:
+            if QUEUE_DROP_POLICY == "drop_oldest":
+                try:
+                    _ = frame_queue.get_nowait()
+                    frame_queue.put_nowait(payload)
+                except queue.Empty:
+                    pass
+            elif QUEUE_DROP_POLICY == "block" and ui_mode == "off":
+                # best effort fallback when queue is saturated
                 pass
-            frame_queue.put_nowait((frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw.copy()))
+            else:
+                # drop_newest: ignore incoming frame to preserve queue continuity for tracker updates
+                pass
 
         overlay = shared_state.get_overlay()
         frame_vis = render_overlay(frame_raw, overlay)

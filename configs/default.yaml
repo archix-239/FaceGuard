@@ -39,6 +39,8 @@ runtime:
   max_seconds: null
   metrics_filename: metrics.jsonl
   video_filename: video.mp4
+  queue_maxsize: 8
+  queue_drop_policy: drop_newest
 
 inference:
   fps: 8.0
