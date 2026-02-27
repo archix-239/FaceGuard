@@ -283,6 +283,7 @@ try:
         track_ok = False
         need_detect_reason = ""
         landmarks = None
+        roi_bbox = None
 
         if TRACKING_ENABLED:
             periodic_due = (frame_idx % DETECT_EVERY_N_FRAMES == 0)
@@ -299,6 +300,7 @@ try:
                 need_detect_reason = "track_only"
 
             if not need_detect:
+                roi_bbox = tracked_bbox
                 with Timer(frame_timings.timings_ms, "tracker"):
                     ok, bbox = tracker.update(frame_raw)
                 tracker_ran = True
@@ -306,6 +308,7 @@ try:
                 if ok:
                     x, y, w, h = clip_bbox_xywh(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), img_w, img_h)
                     tracked_bbox = (x, y, w, h)
+                    roi_bbox = tracked_bbox
                     track_ok = True
                     missed_frames = 0
                 else:
@@ -335,6 +338,7 @@ try:
                     y_max = max(0, min(img_h, int(y_max_w * scale_y)))
                     bx, by, bw, bh = clip_bbox_xywh(x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h)
                     tracked_bbox = (int(bx), int(by), int(bw), int(bh))
+                    roi_bbox = tracked_bbox
 
                     tracker = create_tracker(TRACKER_TYPE)
                     if tracker is not None:
@@ -370,11 +374,13 @@ try:
                 y_min = max(0, min(img_h, int(y_min_w * scale_y)))
                 y_max = max(0, min(img_h, int(y_max_w * scale_y)))
                 bx, by, bw, bh = clip_bbox_xywh(x_min, y_min, max(1, x_max - x_min), max(1, y_max - y_min), img_w, img_h)
-                tracked_bbox = (int(bx), int(by), int(bw), int(bh))
+                roi_bbox = (int(bx), int(by), int(bw), int(bh))
+                tracked_bbox = None
                 tracker = None
-                track_ok = True
+                track_ok = False
                 missed_frames = 0
             else:
+                tracked_bbox = None
                 track_ok = False
                 missed_frames += 1
         threat_score = 0
@@ -386,12 +392,12 @@ try:
         is_asymmetric = False
 
         x_min = y_min = x_max = y_max = None
-        if tracked_bbox is not None:
-            bx, by, bw, bh = tracked_bbox
+        if roi_bbox is not None:
+            bx, by, bw, bh = roi_bbox
             x_min, y_min = bx, by
             x_max, y_max = bx + bw, by + bh
 
-        frame_timings.has_face = tracked_bbox is not None
+        frame_timings.has_face = roi_bbox is not None
 
         # Géométrie/asymétrie uniquement quand landmarks disponibles (frames de détection)
         if landmarks is not None:
@@ -403,7 +409,7 @@ try:
                     threat_score += 40
 
         # Préprocess + inférence via bbox (détection ou tracking)
-        if tracked_bbox is not None:
+        if roi_bbox is not None:
             x_min_w = max(0, min(work_w - 1, int(x_min / scale_x)))
             x_max_w = max(0, min(work_w, int(x_max / scale_x)))
             y_min_w = max(0, min(work_h - 1, int(y_min / scale_y)))
@@ -459,10 +465,10 @@ try:
                         connection_drawing_spec=MpDrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=0),
                     )
 
-                if tracked_bbox is not None:
+                if roi_bbox is not None:
                     cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
 
-                if tracked_bbox is not None and len(preds_buffer) > 0:
+                if roi_bbox is not None and len(preds_buffer) > 0:
                     forehead_x = x_min + (x_max - x_min) // 2
                     forehead_y = y_min
                     box_right_x = min(x_max + 30, img_w - 200)
@@ -507,7 +513,7 @@ try:
                 should_quit = (cv2.waitKey(5) & 0xFF == 27)
 
             elif ui_mode == "min":
-                if tracked_bbox is not None:
+                if roi_bbox is not None:
                     cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
                 cv2.putText(frame_vis, f"EMO: {dom_emo}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                 cv2.putText(frame_vis, f"THREAT: {threat_score}", (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
