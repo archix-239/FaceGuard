@@ -32,6 +32,11 @@ def _apply_path_resolution(config: Dict[str, Any]) -> Dict[str, Any]:
     out = deepcopy(config)
     out["models"]["emotion_model_path"] = _resolve_repo_path(out["models"]["emotion_model_path"])
     out["models"]["face_landmarker_path"] = _resolve_repo_path(out["models"]["face_landmarker_path"])
+    inference_cfg = out.get("inference", {})
+    tflite_model_path = inference_cfg.get("tflite_model_path")
+    if tflite_model_path:
+        inference_cfg["tflite_model_path"] = _resolve_repo_path(str(tflite_model_path))
+    out["inference"] = inference_cfg
     return out
 
 

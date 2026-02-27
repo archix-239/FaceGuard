@@ -42,6 +42,10 @@ runtime:
 
 inference:
   fps: 8.0
+  backend: keras
+  tflite_model_path: models/faceguard_fp32.tflite
+  tflite_num_threads: 4
+  warmup_runs: 3
 
 work_frame:
   enabled: true
