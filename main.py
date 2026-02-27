@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--outdir", type=str, default=None, help="Output directory for runs")
     parser.add_argument("--record-overlay", action="store_true", help="Record annotated frames instead of raw frames")
     parser.add_argument("--max-seconds", type=float, default=None, help="Maximum runtime duration in seconds")
+    parser.add_argument("--fps-infer", type=float, default=None, help="Override inference fps scheduler")
     return parser.parse_args()
 
 
@@ -113,7 +114,7 @@ EMOTION_CLASSES = config["emotion"]["classes"]
 WORK_FRAME_ENABLED = bool(config.get("work_frame", {}).get("enabled", False))
 WORK_FRAME_WIDTH = int(config.get("work_frame", {}).get("width", 640))
 WORK_FRAME_HEIGHT = int(config.get("work_frame", {}).get("height", 360))
-infer_cfg_fps = config.get("inference", {}).get("fps", 8.0)
+infer_cfg_fps = args.fps_infer if args.fps_infer is not None else config.get("inference", {}).get("fps", 8.0)
 INFER_FPS = float(infer_cfg_fps) if infer_cfg_fps is not None else 0.0
 INFER_ENABLED = INFER_FPS > 0.0
 INFER_INTERVAL_MS = (1000.0 / INFER_FPS) if INFER_ENABLED else None
@@ -217,6 +218,10 @@ if not args.replay:
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(config["camera"]["width"]))
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(config["camera"]["height"]))
 
+replay_fps = cap.get(cv2.CAP_PROP_FPS) if args.replay else 0.0
+if args.replay and (not replay_fps or replay_fps <= 0):
+    replay_fps = 30.0
+
 profiler = RunProfiler(output_path=metrics_path)
 frame_idx = 0
 writer = None
@@ -249,9 +254,8 @@ try:
             break
 
         if args.replay:
-            clock_ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            if clock_ts_ms <= 0:
-                clock_ts_ms = float(frame_ts_ms)
+            # Horloge replay fiable basée sur index frame/FPS vidéo
+            clock_ts_ms = (frame_timings.frame_idx / replay_fps) * 1000.0
         else:
             clock_ts_ms = time.time() * 1000.0
 
@@ -563,3 +567,4 @@ if interrupted:
 print(f"[✅] infer_count: {infer_count}")
 print(f"[✅] duration_sec: {run_duration_sec:.2f}")
 print(f"[✅] effective_infer_fps: {effective_infer_fps:.2f}")
+print(f"[✅] fps_infer_config: {INFER_FPS:.2f}")
