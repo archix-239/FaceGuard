@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--record-overlay", action="store_true", help="Record annotated frames instead of raw frames")
     parser.add_argument("--max-seconds", type=float, default=None, help="Maximum runtime duration in seconds")
     parser.add_argument("--fps-infer", type=float, default=None, help="Override inference fps scheduler")
+    parser.add_argument("--replay-realtime", action="store_true", help="Throttle replay playback to real-time source clock")
     return parser.parse_args()
 
 
@@ -154,6 +155,8 @@ class SharedState:
         self.overlay = OverlayState()
         self.infer_count = 0
         self.capture_loop_ms: list[float] = []
+        self.first_clock_ts_ms: int | None = None
+        self.last_clock_ts_ms: int | None = None
 
     def update_overlay(self, overlay: OverlayState):
         with self._lock:
@@ -183,6 +186,19 @@ class SharedState:
     def get_infer_count(self) -> int:
         with self._lock:
             return self.infer_count
+
+    def update_source_clock(self, clock_ts_ms: int):
+        with self._lock:
+            if self.first_clock_ts_ms is None:
+                self.first_clock_ts_ms = int(clock_ts_ms)
+            self.last_clock_ts_ms = int(clock_ts_ms)
+
+    def get_source_duration_sec(self) -> float | None:
+        with self._lock:
+            if self.first_clock_ts_ms is None or self.last_clock_ts_ms is None:
+                return None
+            delta_ms = max(0, self.last_clock_ts_ms - self.first_clock_ts_ms)
+            return delta_ms / 1000.0
 
 
 print("\n" + "=" * 50)
@@ -286,7 +302,7 @@ if args.replay and (not replay_fps or replay_fps <= 0):
     replay_fps = 30.0
 
 profiler = RunProfiler(output_path=metrics_path)
-frame_queue: queue.Queue[tuple[int, int, float, float, np.ndarray]] = queue.Queue(maxsize=2)
+frame_queue: queue.Queue[tuple[int, int, int, float, np.ndarray]] = queue.Queue(maxsize=2)
 shared_state = SharedState()
 stop_event = threading.Event()
 writer = None
@@ -364,6 +380,7 @@ def processing_loop():
     while not stop_event.is_set() or not frame_queue.empty():
         try:
             frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw = frame_queue.get(timeout=0.1)
+            shared_state.update_source_clock(clock_ts_ms)
         except queue.Empty:
             continue
 
@@ -604,6 +621,8 @@ def processing_loop():
 def capture_loop():
     nonlocal_writer = {"writer": None}
     frame_idx = 0
+    prev_replay_clock_ts_ms = None
+    last_replay_wall_ts = None
 
     while cap.isOpened() and not stop_event.is_set():
         capture_loop_start = time.perf_counter()
@@ -626,11 +645,22 @@ def capture_loop():
         if args.replay:
             pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             if pos_msec and pos_msec > 0:
-                clock_ts_ms = float(pos_msec)
+                clock_ts_ms = int(pos_msec)
             else:
-                clock_ts_ms = (frame_idx / replay_fps) * 1000.0
+                clock_ts_ms = int((frame_idx / replay_fps) * 1000.0)
+
+            if args.replay_realtime:
+                now_wall = time.perf_counter()
+                if prev_replay_clock_ts_ms is not None and last_replay_wall_ts is not None:
+                    source_delta_s = max(0.0, (clock_ts_ms - prev_replay_clock_ts_ms) / 1000.0)
+                    target_wall_ts = last_replay_wall_ts + source_delta_s
+                    sleep_s = target_wall_ts - now_wall
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                last_replay_wall_ts = time.perf_counter()
+                prev_replay_clock_ts_ms = clock_ts_ms
         else:
-            clock_ts_ms = time.time() * 1000.0
+            clock_ts_ms = int(time.time() * 1000.0)
 
         try:
             frame_queue.put_nowait((frame_ts_ms, frame_idx, clock_ts_ms, capture_ms, frame_raw.copy()))
@@ -703,9 +733,10 @@ finally:
     profiler.print_summary()
     profiler.close()
 
-run_duration_sec = max(time.perf_counter() - run_start, 1e-9)
+source_duration_sec = shared_state.get_source_duration_sec()
+run_duration_sec = source_duration_sec if source_duration_sec is not None and source_duration_sec > 0 else max(time.perf_counter() - run_start, 1e-9)
 infer_count = shared_state.get_infer_count()
-effective_infer_fps = infer_count / run_duration_sec
+effective_infer_fps = infer_count / max(run_duration_sec, 1e-9)
 
 print(f"[✅] Run ID: {run_id}")
 print(f"[✅] Metrics: {metrics_path}")
@@ -716,5 +747,7 @@ if interrupted:
     print("[✅] Run interrompu proprement.")
 print(f"[✅] infer_count: {infer_count}")
 print(f"[✅] duration_sec: {run_duration_sec:.2f}")
+if source_duration_sec is not None:
+    print(f"[✅] source_duration_sec: {source_duration_sec:.2f}")
 print(f"[✅] effective_infer_fps: {effective_infer_fps:.2f}")
 print(f"[✅] fps_infer_config: {INFER_FPS:.2f}")

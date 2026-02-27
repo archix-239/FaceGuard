@@ -115,6 +115,7 @@ python main.py --fps-infer 2 --ui off --max-seconds 20
 - **Métrique `total`** dans le profiling = temps **total du thread traitement** par frame (aussi exposé comme `total_processing`).
 
 ## Record / Replay
+- `duration_sec` et `effective_infer_fps` sont calculés depuis l’horloge source des frames (replay: `CAP_PROP_POS_MSEC`, live: timestamp système), pas depuis le wall-clock de processing.
 - Enregistrer une session:
 ```bash
 python main.py --record
@@ -126,6 +127,10 @@ python main.py --record --record-overlay
 - Rejouer offline sans UI:
 ```bash
 python main.py --replay runs/<run_id>/video.mp4 --no-ui
+```
+- Rejouer à vitesse réelle (throttle horloge source):
+```bash
+python main.py --replay runs/<run_id>/video.mp4 --replay-realtime
 ```
 
 ## Structure du projet
