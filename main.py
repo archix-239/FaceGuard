@@ -281,6 +281,11 @@ REACQUIRE_CFG = tracking_cfg.get("reacquire", {})
 TTL_MS = int(tracking_cfg.get("ttl_ms", 3000))
 DEDUP_IOU_THRESHOLD = float(tracking_cfg.get("dedup_iou_threshold", 0.5))
 
+window_cfg = config.get("window", {})
+WINDOW_MS = int(window_cfg.get("window_ms", 60000))
+FEATURES_HZ = float(window_cfg.get("features_hz", 1))
+MIN_VALID_RATIO = float(window_cfg.get("min_valid_ratio", 0.3))
+
 print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
 try:
     inference_engine = create_inference_backend(
@@ -495,6 +500,8 @@ def processing_loop():
 
         frame_start = time.perf_counter()
         frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
+        frame_timings.window_ms = WINDOW_MS
+        frame_timings.features_events = []
         frame_timings.timings_ms["capture"] = capture_ms
         frame_timings.skipped_frames = skipped_frames
         frame_timings.queue_depth = frame_queue.qsize()
@@ -671,11 +678,15 @@ def processing_loop():
                 y_min_w = max(0, min(work_h - 1, int(by / scale_y)))
                 y_max_w = max(0, min(work_h, int((by + bh) / scale_y)))
 
+                motion = float(math.hypot(person.velocity[0], person.velocity[1]))
                 person_ctx[pid] = {
                     "pose_text": pose_text,
                     "is_asymmetric": is_asymmetric,
                     "local_threat": local_threat,
                     "bbox_display": (bx, by, bx + bw, by + bh),
+                    "motion": motion,
+                    "valid_quality": bool((x_max_w - x_min_w) > 40),
+                    "bbox_area": float(max(1, bw * bh)),
                 }
 
                 if (x_max_w - x_min_w) > 40 and INFER_ENABLED:
@@ -731,6 +742,31 @@ def processing_loop():
                     if dom_emo == "FEAR":
                         local_threat += int(config["threat"]["fear_bonus"])
 
+                valid_quality_person = bool(ctx.get("valid_quality", False))
+                history_len, valid_ratio_60s = person.add_temporal_sample(
+                    ts_ms=clock_ts_ms,
+                    valid=valid_quality_person,
+                    pose=ctx["pose_text"],
+                    asym=ctx["is_asymmetric"],
+                    motion=float(ctx.get("motion", 0.0)),
+                    emo_probs=np.array(person.last_prediction, copy=False),
+                    threat_frame=int(local_threat),
+                    infer_ran=bool(pid in batch_pids),
+                    bbox_area=float(ctx.get("bbox_area", 0.0)),
+                    window_ms=WINDOW_MS,
+                )
+                ctx["history_len"] = history_len
+                ctx["valid_ratio_60s"] = valid_ratio_60s
+                feat_evt = person.maybe_emit_features(
+                    clock_ts_ms=clock_ts_ms, window_ms=WINDOW_MS, features_hz=FEATURES_HZ
+                )
+                if feat_evt is not None:
+                    feat_evt["features"]["min_valid_ratio"] = MIN_VALID_RATIO
+                    feat_evt["features"]["valid_enough"] = (
+                        float(feat_evt["features"].get("valid_ratio", 0.0)) >= MIN_VALID_RATIO
+                    )
+                    frame_timings.features_events.append(feat_evt)
+
                 people_overlay.append(
                     PersonOverlay(
                         person_id=pid,
@@ -782,6 +818,8 @@ def processing_loop():
                     "emo": po.dom_emo,
                     "threat": po.threat_score,
                     "pose": po.pose_text,
+                    "history_len": int(person_ctx.get(po.person_id, {}).get("history_len", 0)),
+                    "valid_ratio_60s": float(person_ctx.get(po.person_id, {}).get("valid_ratio_60s", 0.0)),
                 }
                 for po in people_overlay
             ]

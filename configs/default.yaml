@@ -68,3 +68,8 @@ tracking:
   reacquire:
     grace_ms: 3000
     multiplier: 2.0
+
+window:
+  window_ms: 60000
+  features_hz: 1
+  min_valid_ratio: 0.3

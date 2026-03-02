@@ -56,6 +56,8 @@ class FrameTimings:
     skipped_frames: int = 0
     queue_depth: int = 0
     dt_ms: float = 0.0
+    window_ms: int | None = None
+    features_events: Optional[List[dict]] = None
 
     def to_json_line(self) -> str:
         payload = {
@@ -86,6 +88,8 @@ class FrameTimings:
             "skipped_frames": self.skipped_frames,
             "queue_depth": self.queue_depth,
             "dt_ms": round(self.dt_ms, 2),
+            "window_ms": self.window_ms,
+            "features_events": self.features_events if self.features_events is not None else [],
         }
         return json.dumps(payload, ensure_ascii=False)
 
