@@ -146,13 +146,17 @@ class MultiPersonTracker:
     def predict_bbox(
         self, person: PersonState, ts_ms: int
     ) -> tuple[int, int, int, int]:
-        """Constant-velocity bbox prediction."""
+        """Constant-velocity bbox prediction with capped displacement."""
         dt = ts_ms - person.last_seen_ts_ms
         if dt <= 0:
             return person.bbox
         x, y, w, h = person.bbox
         vx, vy = person.velocity
-        return (int(x + vx * dt), int(y + vy * dt), w, h)
+        # Cap displacement to 2x the bbox diagonal to prevent runaway predictions
+        max_disp = 2.0 * math.hypot(w, h)
+        dx = max(-max_disp, min(max_disp, vx * dt))
+        dy = max(-max_disp, min(max_disp, vy * dt))
+        return (int(x + dx), int(y + dy), w, h)
 
     # -- Matching cost ------------------------------------------------------
 
@@ -164,9 +168,12 @@ class MultiPersonTracker:
         ts_ms: int,
     ) -> float:
         pred_bbox = self.predict_bbox(person, ts_ms)
-        iou = bbox_iou(pred_bbox, det_bbox)
+        # Also try matching against raw (non-predicted) bbox for robustness
+        iou_pred = bbox_iou(pred_bbox, det_bbox)
+        iou_raw = bbox_iou(person.bbox, det_bbox)
+        iou = max(iou_pred, iou_raw)
 
-        # Relax thresholds during reacquire grace window
+        # Relax thresholds during reacquire grace window, progressively
         eff_iou_min = self.iou_min
         eff_dist_max = self.dist_max_norm
         grace_active = (
@@ -174,12 +181,18 @@ class MultiPersonTracker:
             and (ts_ms - person.last_detect_ts_ms) <= self.reacquire_grace_ms
         )
         if grace_active:
-            eff_iou_min = self.iou_min / self.reacquire_multiplier
-            eff_dist_max = self.dist_max_norm * self.reacquire_multiplier
+            # Progressive relaxation: more misses = wider search (up to 3x)
+            miss_scale = 1.0 + min(person.missed_detect_count, 10) * 0.2
+            eff_iou_min = self.iou_min / (self.reacquire_multiplier * miss_scale)
+            eff_dist_max = self.dist_max_norm * self.reacquire_multiplier * miss_scale
 
-        pc = bbox_center(pred_bbox)
+        # Use best center (predicted or raw) for distance computation
+        pc_pred = bbox_center(pred_bbox)
+        pc_raw = bbox_center(person.bbox)
         dc = bbox_center(det_bbox)
-        dist = math.hypot(pc[0] - dc[0], pc[1] - dc[1])
+        dist_pred = math.hypot(pc_pred[0] - dc[0], pc_pred[1] - dc[1])
+        dist_raw = math.hypot(pc_raw[0] - dc[0], pc_raw[1] - dc[1])
+        dist = min(dist_pred, dist_raw)
         dist_norm = dist / max(frame_diag, 1.0)
 
         area_p = max(pred_bbox[2] * pred_bbox[3], 1)

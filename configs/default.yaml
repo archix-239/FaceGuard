@@ -59,12 +59,12 @@ tracking:
   detect_every_n_frames: 15
   tracker_type: MOSSE
   max_missed_frames: 30
-  ttl_ms: 3000
+  ttl_ms: 5000
   dedup_iou_threshold: 0.5
   match:
-    iou_min: 0.15
-    dist_max_norm: 0.4
-    size_penalty_weight: 0.3
+    iou_min: 0.10
+    dist_max_norm: 0.5
+    size_penalty_weight: 0.2
   reacquire:
-    grace_ms: 1500
-    multiplier: 1.5
+    grace_ms: 3000
+    multiplier: 2.0

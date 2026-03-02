@@ -617,6 +617,10 @@ def processing_loop():
                         else:
                             person.tracker = None
                             person.missed_detect_count += 1
+                            # Still update bbox with velocity prediction
+                            pred = multi_tracker.predict_bbox(person, clock_ts_ms)
+                            person.bbox = pred
+                            person.last_seen_ts_ms = clock_ts_ms
                     else:
                         # Velocity-based fallback
                         pred = multi_tracker.predict_bbox(person, clock_ts_ms)
