@@ -635,7 +635,7 @@ def processing_loop():
                     p.missed_detect_count == 0 for p in multi_tracker.persons.values()
                 )
 
-            # --- Per-person inference & scoring ---
+            # --- Per-person inference & scoring (batched) ---
             people_overlay: list[PersonOverlay] = []
             any_infer_ran = False
             any_valid_quality = False
@@ -644,6 +644,11 @@ def processing_loop():
             primary_dom_emo = "SCANNING..."
             primary_threat = 0
             primary_pose = "INCONNU"
+
+            # Phase 1: pose / asymmetry + preprocess (collect batch)
+            person_ctx: dict[int, dict] = {}
+            batch_pids: list[int] = []
+            batch_tensors: list[np.ndarray] = []
 
             for pid, person in multi_tracker.persons.items():
                 pose_text = "INCONNU"
@@ -660,14 +665,19 @@ def processing_loop():
                             is_asymmetric = True
                             local_threat += 40
 
-                # ROI in work-frame coords for inference
                 bx, by, bw, bh = person.bbox
                 x_min_w = max(0, min(work_w - 1, int(bx / scale_x)))
                 x_max_w = max(0, min(work_w, int((bx + bw) / scale_x)))
                 y_min_w = max(0, min(work_h - 1, int(by / scale_y)))
                 y_max_w = max(0, min(work_h, int((by + bh) / scale_y)))
 
-                person_infer_ran = False
+                person_ctx[pid] = {
+                    "pose_text": pose_text,
+                    "is_asymmetric": is_asymmetric,
+                    "local_threat": local_threat,
+                    "bbox_display": (bx, by, bx + bw, by + bh),
+                }
+
                 if (x_max_w - x_min_w) > 40 and INFER_ENABLED:
                     any_valid_quality = True
                     if person.next_infer_ts_ms is None:
@@ -685,19 +695,31 @@ def processing_loop():
                         total_preprocess_ms += (time.perf_counter() - pp_t0) * 1000.0
 
                         if tensor is not None:
-                            inf_t0 = time.perf_counter()
-                            raw_preds = inference_engine.predict(tensor)
-                            total_infer_ms += (time.perf_counter() - inf_t0) * 1000.0
-                            person.preds_buffer.append(raw_preds)
-                            person.last_prediction = np.mean(
-                                person.preds_buffer, axis=0
-                            )
-                            person_infer_ran = True
-                            any_infer_ran = True
-                            shared_state.inc_infer_count()
+                            batch_pids.append(pid)
+                            batch_tensors.append(tensor)
                         person.next_infer_ts_ms = clock_ts_ms + INFER_INTERVAL_MS
 
-                # Emotion & threat
+            # Phase 2: batched inference (single forward pass when supported)
+            if batch_tensors:
+                inf_t0 = time.perf_counter()
+                batch_input = np.concatenate(batch_tensors, axis=0)
+                all_preds = inference_engine.predict_batch(batch_input)
+                total_infer_ms = (time.perf_counter() - inf_t0) * 1000.0
+
+                for i, pid in enumerate(batch_pids):
+                    person = multi_tracker.persons[pid]
+                    person.preds_buffer.append(all_preds[i])
+                    person.last_prediction = np.mean(
+                        person.preds_buffer, axis=0
+                    )
+                    shared_state.inc_infer_count()
+                any_infer_ran = True
+
+            # Phase 3: scoring & overlay
+            for pid, person in multi_tracker.persons.items():
+                ctx = person_ctx[pid]
+                local_threat = ctx["local_threat"]
+
                 dom_emo = "SCANNING..."
                 activation = 0.0
                 if len(person.preds_buffer) > 0:
@@ -712,12 +734,12 @@ def processing_loop():
                 people_overlay.append(
                     PersonOverlay(
                         person_id=pid,
-                        bbox=(bx, by, bx + bw, by + bh),
+                        bbox=ctx["bbox_display"],
                         dom_emo=dom_emo,
                         threat_score=local_threat,
-                        pose_text=pose_text,
+                        pose_text=ctx["pose_text"],
                         last_prediction=np.array(person.last_prediction, copy=True),
-                        is_asymmetric=is_asymmetric,
+                        is_asymmetric=ctx["is_asymmetric"],
                     )
                 )
 

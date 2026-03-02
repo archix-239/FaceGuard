@@ -18,8 +18,26 @@ class InferenceDetails:
 
 
 class InferenceBackend:
+    @property
+    def supports_batch(self) -> bool:
+        """Return True if this backend benefits from batched inference."""
+        return False
+
     def predict(self, tensor: np.ndarray) -> np.ndarray:
         raise NotImplementedError
+
+    def predict_batch(self, batch: np.ndarray) -> np.ndarray:
+        """Predict on a batch of N samples.
+
+        *batch* has shape ``(N, H, W, C)``.
+        Returns an ``(N, num_classes)`` array.
+
+        The default implementation loops over individual samples which is
+        used as a fallback when the backend does not support native batching.
+        """
+        n = batch.shape[0]
+        results = [self.predict(batch[i : i + 1]) for i in range(n)]
+        return np.stack(results, axis=0)
 
     def details(self) -> InferenceDetails:
         raise NotImplementedError
@@ -48,9 +66,18 @@ class KerasInferenceBackend(InferenceBackend):
             output_dtype="float32",
         )
 
+    @property
+    def supports_batch(self) -> bool:
+        return True
+
     def predict(self, tensor: np.ndarray) -> np.ndarray:
         preds = self.model(tensor, training=False)
         return np.asarray(preds[0], dtype=np.float32)
+
+    def predict_batch(self, batch: np.ndarray) -> np.ndarray:
+        """Native batch inference — single forward pass for N faces."""
+        preds = self.model(batch, training=False)
+        return np.asarray(preds, dtype=np.float32)
 
     def details(self) -> InferenceDetails:
         return self._details
