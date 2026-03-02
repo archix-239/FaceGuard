@@ -16,6 +16,7 @@ from faceguard.config import load_config
 from faceguard.profiling import Timer, FrameTimings, RunProfiler
 from faceguard.services.inference_backend import create_inference_backend
 from faceguard.tracking import MultiPersonTracker, bbox_center, bbox_iou
+from faceguard.fsm import FSMConfig, PersonFSM
 
 
 UI_MODES = ("full", "min", "off")
@@ -143,6 +144,8 @@ class PersonOverlay:
     pose_text: str = "INCONNU"
     last_prediction: np.ndarray = field(default_factory=lambda: np.zeros(8, dtype=np.float32))
     is_asymmetric: bool = False
+    state: str = "CALM"
+    state_confidence: float = 0.0
 
 
 @dataclass
@@ -186,6 +189,8 @@ class SharedState:
                     pose_text=p.pose_text,
                     last_prediction=np.array(p.last_prediction, copy=True),
                     is_asymmetric=p.is_asymmetric,
+                    state=p.state,
+                    state_confidence=p.state_confidence,
                 )
                 for p in self.overlay.people
             ]
@@ -280,6 +285,13 @@ MATCH_CFG = tracking_cfg.get("match", {})
 REACQUIRE_CFG = tracking_cfg.get("reacquire", {})
 TTL_MS = int(tracking_cfg.get("ttl_ms", 3000))
 DEDUP_IOU_THRESHOLD = float(tracking_cfg.get("dedup_iou_threshold", 0.5))
+
+window_cfg = config.get("window", {})
+WINDOW_MS = int(window_cfg.get("window_ms", 60000))
+FEATURES_HZ = float(window_cfg.get("features_hz", 1))
+MIN_VALID_RATIO = float(window_cfg.get("min_valid_ratio", 0.3))
+fsm_cfg_raw = config.get("fsm", {})
+FSM_CFG = FSMConfig.from_dict(fsm_cfg_raw, fallback_min_valid_ratio=MIN_VALID_RATIO)
 
 print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
 try:
@@ -392,7 +404,7 @@ def render_overlay(frame_raw: np.ndarray, overlay: OverlayState):
             if ui_mode in ("full", "min"):
                 # Bbox with ID label
                 cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
-                label = f"ID:{person.person_id} {person.dom_emo} T:{person.threat_score}"
+                label = f"#{person.person_id} {person.state} {person.dom_emo} T:{person.threat_score}"
                 cv2.putText(frame_vis, label, (x_min, max(y_min - 5, 15)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
@@ -495,6 +507,8 @@ def processing_loop():
 
         frame_start = time.perf_counter()
         frame_timings = FrameTimings(ts_ms=frame_ts_ms, frame_idx=frame_idx)
+        frame_timings.window_ms = WINDOW_MS
+        frame_timings.features_events = []
         frame_timings.timings_ms["capture"] = capture_ms
         frame_timings.skipped_frames = skipped_frames
         frame_timings.queue_depth = frame_queue.qsize()
@@ -671,11 +685,15 @@ def processing_loop():
                 y_min_w = max(0, min(work_h - 1, int(by / scale_y)))
                 y_max_w = max(0, min(work_h, int((by + bh) / scale_y)))
 
+                motion = float(math.hypot(person.velocity[0], person.velocity[1]))
                 person_ctx[pid] = {
                     "pose_text": pose_text,
                     "is_asymmetric": is_asymmetric,
                     "local_threat": local_threat,
                     "bbox_display": (bx, by, bx + bw, by + bh),
+                    "motion": motion,
+                    "valid_quality": bool((x_max_w - x_min_w) > 40),
+                    "bbox_area": float(max(1, bw * bh)),
                 }
 
                 if (x_max_w - x_min_w) > 40 and INFER_ENABLED:
@@ -731,6 +749,49 @@ def processing_loop():
                     if dom_emo == "FEAR":
                         local_threat += int(config["threat"]["fear_bonus"])
 
+                valid_quality_person = bool(ctx.get("valid_quality", False))
+                history_len, valid_ratio_60s = person.add_temporal_sample(
+                    ts_ms=clock_ts_ms,
+                    valid=valid_quality_person,
+                    pose=ctx["pose_text"],
+                    asym=ctx["is_asymmetric"],
+                    motion=float(ctx.get("motion", 0.0)),
+                    emo_probs=np.array(person.last_prediction, copy=False),
+                    threat_frame=int(local_threat),
+                    infer_ran=bool(pid in batch_pids),
+                    bbox_area=float(ctx.get("bbox_area", 0.0)),
+                    window_ms=WINDOW_MS,
+                )
+                ctx["history_len"] = history_len
+                ctx["valid_ratio_60s"] = valid_ratio_60s
+                feat_evt = person.maybe_emit_features(
+                    clock_ts_ms=clock_ts_ms, window_ms=WINDOW_MS, features_hz=FEATURES_HZ
+                )
+                if feat_evt is not None:
+                    feat_evt["features"]["min_valid_ratio"] = MIN_VALID_RATIO
+                    feat_evt["features"]["valid_enough"] = (
+                        float(feat_evt["features"].get("valid_ratio", 0.0)) >= MIN_VALID_RATIO
+                    )
+                    if FSM_CFG.enabled:
+                        if person.fsm is None:
+                            person.fsm = PersonFSM(FSM_CFG)
+                        fsm_state, transition_evt = person.fsm.update(
+                            ts_ms=clock_ts_ms,
+                            features=feat_evt["features"],
+                            has_face=bool(history_len > 0),
+                            valid_ratio=float(feat_evt["features"].get("valid_ratio", 0.0)),
+                            face_presence_ratio=float(feat_evt["features"].get("face_presence_ratio", 0.0)),
+                        )
+                        person.intent_state = str(fsm_state)
+                        # simple confidence proxy from threat_mean normalized
+                        person.state_confidence = max(0.0, min(1.0, float(feat_evt["features"].get("threat_mean", 0.0)) / 100.0))
+                        feat_evt["state"] = person.intent_state
+                        feat_evt["state_confidence"] = person.state_confidence
+                        if transition_evt is not None:
+                            transition_evt["person_id"] = int(pid)
+                            frame_timings.features_events.append(transition_evt)
+                    frame_timings.features_events.append(feat_evt)
+
                 people_overlay.append(
                     PersonOverlay(
                         person_id=pid,
@@ -740,6 +801,8 @@ def processing_loop():
                         pose_text=ctx["pose_text"],
                         last_prediction=np.array(person.last_prediction, copy=True),
                         is_asymmetric=ctx["is_asymmetric"],
+                        state=person.intent_state,
+                        state_confidence=person.state_confidence,
                     )
                 )
 
@@ -782,6 +845,9 @@ def processing_loop():
                     "emo": po.dom_emo,
                     "threat": po.threat_score,
                     "pose": po.pose_text,
+                    "history_len": int(person_ctx.get(po.person_id, {}).get("history_len", 0)),
+                    "valid_ratio_60s": float(person_ctx.get(po.person_id, {}).get("valid_ratio_60s", 0.0)),
+                    "state": str(next((p.intent_state for pid2, p in multi_tracker.persons.items() if pid2 == po.person_id), "CALM")),
                 }
                 for po in people_overlay
             ]
