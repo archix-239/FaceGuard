@@ -3,6 +3,7 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision import RunningMode
 import numpy as np
 from collections import deque
 import math
@@ -17,6 +18,7 @@ from faceguard.profiling import Timer, FrameTimings, RunProfiler
 from faceguard.services.inference_backend import create_inference_backend
 from faceguard.tracking import MultiPersonTracker, bbox_center, bbox_iou
 from faceguard.fsm import FSMConfig, PersonFSM
+from faceguard.track_health import evaluate_tracking_health
 
 
 UI_MODES = ("full", "min", "off")
@@ -285,6 +287,8 @@ MATCH_CFG = tracking_cfg.get("match", {})
 REACQUIRE_CFG = tracking_cfg.get("reacquire", {})
 TTL_MS = int(tracking_cfg.get("ttl_ms", 3000))
 DEDUP_IOU_THRESHOLD = float(tracking_cfg.get("dedup_iou_threshold", 0.5))
+MIN_REDETECT_INTERVAL_MS = int(tracking_cfg.get("min_redetect_interval_ms", 400))
+TRACK_HEALTH_CFG = tracking_cfg.get("track_health", {})
 
 window_cfg = config.get("window", {})
 WINDOW_MS = int(window_cfg.get("window_ms", 60000))
@@ -317,7 +321,7 @@ if INFER_WARMUP_RUNS > 0:
 
 print(f"[⏳] Initialisation des capteurs géométriques (max_faces={MAX_FACES})...")
 base_options = python.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH)
-options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=MAX_FACES)
+options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=MAX_FACES, running_mode=RunningMode.VIDEO)
 detector = vision.FaceLandmarker.create_from_options(options)
 
 clahe = cv2.createCLAHE(
@@ -384,7 +388,7 @@ def _render_person_full(frame_vis, person: PersonOverlay, img_w, img_h):
             ts_color = (0, 0, 255)
         frame_vis = draw_transparent_box(frame_vis, box_left_x, box_left_y, 200, 110, alpha=0.6)
         cv2.line(frame_vis, (box_left_x, box_left_y + 25), (box_left_x + 200, box_left_y + 25), (200, 200, 200), 1)
-        cv2.putText(frame_vis, f"{person.dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame_vis, f"{person.state} | {person.dom_emo}", (box_left_x + 10, box_left_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(frame_vis, f"THREAT SCORE: {person.threat_score}", (box_left_x + 10, box_left_y + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ts_color, 2)
         if person.is_asymmetric:
             cv2.putText(frame_vis, "ASYMETRIE", (box_left_x + 10, box_left_y + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
@@ -479,6 +483,7 @@ def processing_loop():
 
     next_detect_ts_ms = None
     prev_clock_ts_ms = None
+    last_detect_attempt_ts_ms = None
 
     # Fallback for tracking-disabled mode (single-face, legacy behaviour)
     legacy_preds_buffer = deque(maxlen=int(config["emotion"]["preds_buffer_maxlen"]))
@@ -547,6 +552,22 @@ def processing_loop():
                 need_detect_reason = "no_persons"
 
             if not need_detect:
+                degraded_reason = None
+                for _pid, _person in multi_tracker.persons.items():
+                    healthy, reason = evaluate_tracking_health(_person, img_w, img_h, TRACK_HEALTH_CFG)
+                    if not healthy:
+                        degraded_reason = reason
+                        break
+                if degraded_reason is not None:
+                    enough_since_detect = (
+                        last_detect_attempt_ts_ms is None
+                        or (clock_ts_ms - last_detect_attempt_ts_ms) >= MIN_REDETECT_INTERVAL_MS
+                    )
+                    if enough_since_detect:
+                        need_detect = True
+                        need_detect_reason = f"tracking_degraded:{degraded_reason}"
+
+            if not need_detect:
                 if DETECT_EVERY_MS is not None:
                     if next_detect_ts_ms is None:
                         next_detect_ts_ms = clock_ts_ms
@@ -561,12 +582,13 @@ def processing_loop():
             if need_detect:
                 # --- Detection frame: MediaPipe multi-face ---
                 detect_ran = True
+                last_detect_attempt_ts_ms = clock_ts_ms
                 with Timer(frame_timings.timings_ms, "mediapipe"):
                     mp_image = mp.Image(
                         image_format=mp.ImageFormat.SRGB,
                         data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB),
                     )
-                    res = detector.detect(mp_image)
+                    res = detector.detect_for_video(mp_image, timestamp_ms=int(clock_ts_ms))
 
                 if DETECT_EVERY_MS is not None:
                     next_detect_ts_ms = clock_ts_ms + DETECT_EVERY_MS
@@ -592,7 +614,8 @@ def processing_loop():
                     time.perf_counter() - tracker_init_t0
                 ) * 1000.0
                 track_ok = any(
-                    p.missed_detect_count == 0 for p in multi_tracker.persons.values()
+                    evaluate_tracking_health(p, img_w, img_h, TRACK_HEALTH_CFG)[0]
+                    for p in multi_tracker.persons.values()
                 )
             else:
                 # --- Track-only frame: update per-person OpenCV trackers ---
@@ -646,7 +669,8 @@ def processing_loop():
                 ) * 1000.0
                 multi_tracker.cleanup_expired(clock_ts_ms)
                 track_ok = any(
-                    p.missed_detect_count == 0 for p in multi_tracker.persons.values()
+                    evaluate_tracking_health(p, img_w, img_h, TRACK_HEALTH_CFG)[0]
+                    for p in multi_tracker.persons.values()
                 )
 
             # --- Per-person inference & scoring (batched) ---
@@ -888,7 +912,7 @@ def processing_loop():
                     image_format=mp.ImageFormat.SRGB,
                     data=cv2.cvtColor(work_frame, cv2.COLOR_BGR2RGB),
                 )
-                res = detector.detect(mp_image)
+                res = detector.detect_for_video(mp_image, timestamp_ms=int(clock_ts_ms))
 
             roi_bbox = None
             landmarks = None

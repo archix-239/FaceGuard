@@ -106,6 +106,7 @@ class PersonState:
     fsm: PersonFSM | None = None
     intent_state: str = "CALM"
     state_confidence: float = 0.0
+    last_detect_area: float = 0.0
 
     def add_temporal_sample(
         self,
@@ -412,6 +413,7 @@ class MultiPersonTracker:
         person.last_seen_ts_ms = ts_ms
         person.last_detect_ts_ms = ts_ms
         person.missed_detect_count = 0
+        person.last_detect_area = float(max(1, bbox[2] * bbox[3]))
 
     def _create_person(
         self,
@@ -429,5 +431,6 @@ class MultiPersonTracker:
             landmarks=landmarks,
             _prev_center=bbox_center(bbox),
             _prev_center_ts_ms=ts_ms,
+            last_detect_area=float(max(1, bbox[2] * bbox[3])),
         )
         return pid
