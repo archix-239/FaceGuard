@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from faceguard.features import compute_features
+from faceguard.fsm import PersonFSM
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,9 @@ class PersonState:
     _prev_center_ts_ms: int | None = None
     temporal_buffer: deque = field(default_factory=deque)
     last_features_ts_ms: int | None = None
+    fsm: PersonFSM | None = None
+    intent_state: str = "CALM"
+    state_confidence: float = 0.0
 
     def add_temporal_sample(
         self,

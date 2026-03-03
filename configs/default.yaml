@@ -73,3 +73,34 @@ window:
   window_ms: 60000
   features_hz: 1
   min_valid_ratio: 0.3
+
+fsm:
+  enabled: true
+  min_dwell_ms:
+    calm: 2000
+    suspect: 3000
+    threat: 5000
+  thresholds:
+    suspect_enter:
+      threat_mean_min: 20
+      neg_ratio_min: 0.20
+      motion_p95_min: 0.10
+    suspect_exit:
+      threat_mean_max: 12
+      neg_ratio_max: 0.12
+      motion_p95_max: 0.08
+    threat_enter:
+      threat_p95_min: 70
+      threat_mean_min: 40
+      neg_ratio_min: 0.35
+      motion_p95_min: 0.15
+    threat_exit:
+      threat_p95_max: 55
+      threat_mean_max: 28
+      neg_ratio_max: 0.25
+      motion_p95_max: 0.12
+  quality_gate:
+    min_valid_ratio: 0.30
+    min_face_presence_ratio: 0.30
+  no_face_timeout_ms: 1500
+  low_quality_timeout_ms: 2000

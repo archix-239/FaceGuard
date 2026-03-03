@@ -16,6 +16,7 @@ from faceguard.config import load_config
 from faceguard.profiling import Timer, FrameTimings, RunProfiler
 from faceguard.services.inference_backend import create_inference_backend
 from faceguard.tracking import MultiPersonTracker, bbox_center, bbox_iou
+from faceguard.fsm import FSMConfig, PersonFSM
 
 
 UI_MODES = ("full", "min", "off")
@@ -143,6 +144,8 @@ class PersonOverlay:
     pose_text: str = "INCONNU"
     last_prediction: np.ndarray = field(default_factory=lambda: np.zeros(8, dtype=np.float32))
     is_asymmetric: bool = False
+    state: str = "CALM"
+    state_confidence: float = 0.0
 
 
 @dataclass
@@ -186,6 +189,8 @@ class SharedState:
                     pose_text=p.pose_text,
                     last_prediction=np.array(p.last_prediction, copy=True),
                     is_asymmetric=p.is_asymmetric,
+                    state=p.state,
+                    state_confidence=p.state_confidence,
                 )
                 for p in self.overlay.people
             ]
@@ -285,6 +290,8 @@ window_cfg = config.get("window", {})
 WINDOW_MS = int(window_cfg.get("window_ms", 60000))
 FEATURES_HZ = float(window_cfg.get("features_hz", 1))
 MIN_VALID_RATIO = float(window_cfg.get("min_valid_ratio", 0.3))
+fsm_cfg_raw = config.get("fsm", {})
+FSM_CFG = FSMConfig.from_dict(fsm_cfg_raw, fallback_min_valid_ratio=MIN_VALID_RATIO)
 
 print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
 try:
@@ -397,7 +404,7 @@ def render_overlay(frame_raw: np.ndarray, overlay: OverlayState):
             if ui_mode in ("full", "min"):
                 # Bbox with ID label
                 cv2.rectangle(frame_vis, (x_min, y_min), (x_max, y_max), (255, 255, 255), 1)
-                label = f"ID:{person.person_id} {person.dom_emo} T:{person.threat_score}"
+                label = f"#{person.person_id} {person.state} {person.dom_emo} T:{person.threat_score}"
                 cv2.putText(frame_vis, label, (x_min, max(y_min - 5, 15)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
@@ -765,6 +772,24 @@ def processing_loop():
                     feat_evt["features"]["valid_enough"] = (
                         float(feat_evt["features"].get("valid_ratio", 0.0)) >= MIN_VALID_RATIO
                     )
+                    if FSM_CFG.enabled:
+                        if person.fsm is None:
+                            person.fsm = PersonFSM(FSM_CFG)
+                        fsm_state, transition_evt = person.fsm.update(
+                            ts_ms=clock_ts_ms,
+                            features=feat_evt["features"],
+                            has_face=bool(history_len > 0),
+                            valid_ratio=float(feat_evt["features"].get("valid_ratio", 0.0)),
+                            face_presence_ratio=float(feat_evt["features"].get("face_presence_ratio", 0.0)),
+                        )
+                        person.intent_state = str(fsm_state)
+                        # simple confidence proxy from threat_mean normalized
+                        person.state_confidence = max(0.0, min(1.0, float(feat_evt["features"].get("threat_mean", 0.0)) / 100.0))
+                        feat_evt["state"] = person.intent_state
+                        feat_evt["state_confidence"] = person.state_confidence
+                        if transition_evt is not None:
+                            transition_evt["person_id"] = int(pid)
+                            frame_timings.features_events.append(transition_evt)
                     frame_timings.features_events.append(feat_evt)
 
                 people_overlay.append(
@@ -776,6 +801,8 @@ def processing_loop():
                         pose_text=ctx["pose_text"],
                         last_prediction=np.array(person.last_prediction, copy=True),
                         is_asymmetric=ctx["is_asymmetric"],
+                        state=person.intent_state,
+                        state_confidence=person.state_confidence,
                     )
                 )
 
@@ -820,6 +847,7 @@ def processing_loop():
                     "pose": po.pose_text,
                     "history_len": int(person_ctx.get(po.person_id, {}).get("history_len", 0)),
                     "valid_ratio_60s": float(person_ctx.get(po.person_id, {}).get("valid_ratio_60s", 0.0)),
+                    "state": str(next((p.intent_state for pid2, p in multi_tracker.persons.items() if pid2 == po.person_id), "CALM")),
                 }
                 for po in people_overlay
             ]
