@@ -18,6 +18,9 @@ from typing import Any
 
 import numpy as np
 
+from faceguard.features import compute_features
+from faceguard.fsm import PersonFSM
+
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
@@ -98,6 +101,61 @@ class PersonState:
     tracker: Any = None  # OpenCV tracker, managed by caller
     _prev_center: tuple[float, float] | None = None
     _prev_center_ts_ms: int | None = None
+    temporal_buffer: deque = field(default_factory=deque)
+    last_features_ts_ms: int | None = None
+    fsm: PersonFSM | None = None
+    intent_state: str = "CALM"
+    state_confidence: float = 0.0
+    last_detect_area: float = 0.0
+
+    def add_temporal_sample(
+        self,
+        ts_ms: int,
+        valid: bool,
+        pose: str,
+        asym: bool,
+        motion: float,
+        emo_probs: np.ndarray,
+        threat_frame: int,
+        infer_ran: bool,
+        bbox_area: float,
+        window_ms: int,
+    ) -> tuple[int, float]:
+        probs = np.asarray(emo_probs, dtype=np.float32).tolist()
+        self.temporal_buffer.append((
+            int(ts_ms), bool(valid), str(pose), bool(asym), float(motion), probs,
+            float(threat_frame), bool(infer_ran), float(bbox_area),
+        ))
+        self.trim_temporal_buffer(int(ts_ms), int(window_ms))
+        return self.get_history_stats()
+
+    def trim_temporal_buffer(self, now_ms: int, window_ms: int):
+        min_ts = int(now_ms) - int(window_ms)
+        while self.temporal_buffer and int(self.temporal_buffer[0][0]) < min_ts:
+            self.temporal_buffer.popleft()
+
+    def get_history_stats(self) -> tuple[int, float]:
+        n = len(self.temporal_buffer)
+        if n == 0:
+            return 0, 0.0
+        valid = sum(1 for s in self.temporal_buffer if bool(s[1]))
+        return n, float(valid / n)
+
+    def maybe_emit_features(self, clock_ts_ms: int, window_ms: int, features_hz: float):
+        hz = max(1e-6, float(features_hz))
+        period_ms = int(1000.0 / hz)
+        if self.last_features_ts_ms is not None and (int(clock_ts_ms) - int(self.last_features_ts_ms)) < period_ms:
+            return None
+        self.trim_temporal_buffer(int(clock_ts_ms), int(window_ms))
+        samples = list(self.temporal_buffer)
+        feats = compute_features(samples, int(window_ms))
+        self.last_features_ts_ms = int(clock_ts_ms)
+        return {
+            "ts_ms": int(clock_ts_ms),
+            "person_id": int(self.person_id),
+            "window_ms": int(window_ms),
+            "features": feats,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +413,7 @@ class MultiPersonTracker:
         person.last_seen_ts_ms = ts_ms
         person.last_detect_ts_ms = ts_ms
         person.missed_detect_count = 0
+        person.last_detect_area = float(max(1, bbox[2] * bbox[3]))
 
     def _create_person(
         self,
@@ -372,5 +431,6 @@ class MultiPersonTracker:
             landmarks=landmarks,
             _prev_center=bbox_center(bbox),
             _prev_center_ts_ms=ts_ms,
+            last_detect_area=float(max(1, bbox[2] * bbox[3])),
         )
         return pid

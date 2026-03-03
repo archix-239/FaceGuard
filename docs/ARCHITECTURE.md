@@ -12,6 +12,7 @@
 ### Modules logiques (aujourd’hui implicites dans `main.py`)
 - **Chargement modèle IA** : TensorFlow/Keras (`tf.keras.models.load_model`) pour le classifieur d’émotions.
 - **Détection visage / landmarks** : MediaPipe Tasks FaceLandmarker.
+  - Exécuté en `running_mode=VIDEO` avec `detect_for_video(..., timestamp_ms=clock_ts_ms)` pour stabiliser le tracking temporel et réduire les incohérences inter-frame.
 - **Prétraitement image** : crop visage + niveaux de gris + CLAHE + conversion RGB + resize (48x48).
 - **Inférence** : modèle émotion sur tenseur image.
 - **Scoring** : score menace basé sur émotion dominante + asymétrie faciale.
