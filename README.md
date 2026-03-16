@@ -83,6 +83,13 @@ inference:
   tflite_model_path: models/faceguard_fp32.tflite
   tflite_num_threads: 4
   warmup_runs: 3
+  max_faces_per_batch: 3  # limite CPU: traite les N visages les plus récents si surcharge
+```
+
+- Mode focalisé reconnaissance d'émotions (désactive le scoring menace pour alléger le pipeline):
+```yaml
+runtime:
+  emotion_only_mode: true
 ```
 
 - Export modèle Keras -> TFLite fp32:

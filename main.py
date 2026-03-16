@@ -272,6 +272,8 @@ INFER_BACKEND = str(inference_cfg.get("backend", "keras")).lower()
 TFLITE_MODEL_PATH = inference_cfg.get("tflite_model_path")
 TFLITE_NUM_THREADS = int(inference_cfg.get("tflite_num_threads", 1))
 INFER_WARMUP_RUNS = int(inference_cfg.get("warmup_runs", 0))
+MAX_FACES_PER_BATCH_RAW = int(inference_cfg.get("max_faces_per_batch", 0))
+MAX_FACES_PER_BATCH = max(0, MAX_FACES_PER_BATCH_RAW)
 
 TRACKING_ENABLED = bool(config.get("tracking", {}).get("enabled", True))
 tracking_cfg = config.get("tracking", {})
@@ -296,6 +298,7 @@ FEATURES_HZ = float(window_cfg.get("features_hz", 1))
 MIN_VALID_RATIO = float(window_cfg.get("min_valid_ratio", 0.3))
 fsm_cfg_raw = config.get("fsm", {})
 FSM_CFG = FSMConfig.from_dict(fsm_cfg_raw, fallback_min_valid_ratio=MIN_VALID_RATIO)
+EMOTION_ONLY_MODE = bool(config.get("runtime", {}).get("emotion_only_mode", True))
 
 print(f"[⏳] Initialisation backend inférence: {INFER_BACKEND}")
 try:
@@ -701,7 +704,8 @@ def processing_loop():
                         )
                         if asym > float(config["asymmetry"]["threshold"]):
                             is_asymmetric = True
-                            local_threat += 40
+                            if not EMOTION_ONLY_MODE:
+                                local_threat += 40
 
                 bx, by, bw, bh = person.bbox
                 x_min_w = max(0, min(work_w - 1, int(bx / scale_x)))
@@ -746,6 +750,9 @@ def processing_loop():
                 inf_t0 = time.perf_counter()
                 batch_input = np.concatenate(batch_tensors, axis=0)
                 all_preds = inference_engine.predict_batch(batch_input)
+                if MAX_FACES_PER_BATCH > 0 and all_preds.shape[0] > MAX_FACES_PER_BATCH:
+                    all_preds = all_preds[:MAX_FACES_PER_BATCH]
+                    batch_pids = batch_pids[:MAX_FACES_PER_BATCH]
                 total_infer_ms = (time.perf_counter() - inf_t0) * 1000.0
 
                 for i, pid in enumerate(batch_pids):
@@ -768,10 +775,11 @@ def processing_loop():
                     top_idx = person.last_prediction.argsort()[-1]
                     dom_emo = EMOTION_CLASSES[top_idx]
                     activation = person.last_prediction[top_idx] * 100
-                    if dom_emo in ("ANGRY", "CONTEMPT"):
-                        local_threat += int(config["threat"]["angry_contempt_bonus"])
-                    if dom_emo == "FEAR":
-                        local_threat += int(config["threat"]["fear_bonus"])
+                    if not EMOTION_ONLY_MODE:
+                        if dom_emo in ("ANGRY", "CONTEMPT"):
+                            local_threat += int(config["threat"]["angry_contempt_bonus"])
+                        if dom_emo == "FEAR":
+                            local_threat += int(config["threat"]["fear_bonus"])
 
                 valid_quality_person = bool(ctx.get("valid_quality", False))
                 history_len, valid_ratio_60s = person.add_temporal_sample(
@@ -946,7 +954,8 @@ def processing_loop():
                     )
                     if asym_score > float(config["asymmetry"]["threshold"]):
                         is_asymmetric = True
-                        threat_score += 40
+                        if not EMOTION_ONLY_MODE:
+                            threat_score += 40
 
             if roi_bbox is not None:
                 x_min_w = max(0, min(work_w - 1, int(x_min / scale_x)))
@@ -978,10 +987,11 @@ def processing_loop():
                     top_idx = legacy_last_prediction.argsort()[-1]
                     dom_emo = EMOTION_CLASSES[top_idx]
                     activation = legacy_last_prediction[top_idx] * 100
-                    if dom_emo in ("ANGRY", "CONTEMPT"):
-                        threat_score += int(config["threat"]["angry_contempt_bonus"])
-                    if dom_emo == "FEAR":
-                        threat_score += int(config["threat"]["fear_bonus"])
+                    if not EMOTION_ONLY_MODE:
+                        if dom_emo in ("ANGRY", "CONTEMPT"):
+                            threat_score += int(config["threat"]["angry_contempt_bonus"])
+                        if dom_emo == "FEAR":
+                            threat_score += int(config["threat"]["fear_bonus"])
 
             frame_timings.timings_ms["total"] = (
                 time.perf_counter() - frame_start
