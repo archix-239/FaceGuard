@@ -24,10 +24,17 @@ Système de vision par ordinateur focalisé sur la **détection et reconnaissanc
 
 ## Installation
 
+> **Python 3.12 requis.** TensorFlow 2.19 ne supporte pas Python 3.13+.
+> Télécharger Python 3.12 : https://www.python.org/downloads/release/python-3120/
+
 ```bash
-python -m venv venv
-source venv/bin/activate        # Linux/macOS
-# ou: venv\Scripts\activate     # Windows
+# Windows — créer le venv explicitement avec Python 3.12
+py -3.12 -m venv venv
+venv\Scripts\activate
+
+# Linux/macOS
+python3.12 -m venv venv
+source venv/bin/activate
 
 pip install -r requirements.txt
 ```
