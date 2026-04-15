@@ -10,6 +10,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python.vision import RunningMode
 import numpy as np
+import tensorflow as tf
 
 from faceguard.config import load_config
 from faceguard.services.inference_backend import create_inference_backend
@@ -190,10 +191,44 @@ def draw_face(
 
 
 # ---------------------------------------------------------------------------
+# GPU setup
+# ---------------------------------------------------------------------------
+
+def _setup_gpu(gpu_cfg: dict) -> str:
+    """
+    Configure TensorFlow GPU memory growth.
+    Retourne le label du device actif : 'GPU:0', 'GPU:1', ... ou 'CPU'.
+    """
+    if not gpu_cfg.get("enabled", True):
+        tf.config.set_visible_devices([], "GPU")
+        print("[GPU] Désactivé par configuration — CPU uniquement")
+        return "CPU"
+
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        print("[GPU] Aucun GPU détecté — utilisation du CPU")
+        return "CPU"
+
+    try:
+        if gpu_cfg.get("memory_growth", True):
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        names = ", ".join(g.name.split("physical_device:")[-1] for g in gpus)
+        print(f"[GPU] {len(gpus)} GPU détecté(s) : {names}")
+        return f"GPU ({len(gpus)})"
+    except RuntimeError as e:
+        print(f"[GPU] Erreur configuration : {e} — fallback CPU")
+        return "CPU"
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def run(cfg: dict) -> None:
+    # --- GPU ---
+    device_label = _setup_gpu(cfg.get("gpu", {}))
+
     # --- MediaPipe ---
     landmarker = mp_vision.FaceLandmarker.create_from_options(
         mp_vision.FaceLandmarkerOptions(
@@ -399,7 +434,7 @@ def run(cfg: dict) -> None:
 
                 cv2.putText(
                     display,
-                    f"FPS: {fps:.1f}  |  Faces: {len(tracks)}",
+                    f"FPS: {fps:.1f}  |  Faces: {len(tracks)}  |  {device_label}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 80), 2,
                 )
                 cv2.imshow(window_name, display)

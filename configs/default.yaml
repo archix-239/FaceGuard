@@ -30,12 +30,19 @@ ui:
   mode: full          # full | off
   window_name: FaceGuard – Emotion Recognition
 
+# GPU — TensorFlow utilise automatiquement le GPU si disponible
+gpu:
+  enabled: true         # false = forcer CPU même si GPU présent
+  memory_growth: true   # alloue la VRAM progressivement (évite les OOM)
+
 inference:
-  backend: keras      # keras (ConvNeXt — pas de TFLite pour l'instant)
+  backend: auto         # auto = keras si GPU, tflite si CPU uniquement
+                        # keras  = TF/Keras (GPU ou CPU)
+                        # tflite = TFLite CPU (plus léger sans GPU)
   tflite_model_path: models/faceguard_fp32.tflite
   tflite_num_threads: 2
   warmup_runs: 2
-  infer_every_ms: 150  # fréquence d'inférence ~6 Hz
+  infer_every_ms: 150   # fréquence d'inférence ~6 Hz
 
 work_frame:
   enabled: true
