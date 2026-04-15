@@ -16,6 +16,7 @@ runs/
 models/*.h5
 models/*.keras
 models/*.task
+models/*.tflite
 
 # ==========================================
 # DONNÉES ET LOGS
