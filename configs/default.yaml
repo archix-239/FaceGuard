@@ -23,8 +23,9 @@ camera:
 
 # CLAHE appliqué sur canal L (espace LAB) — préserve la couleur
 clahe:
-  clip_limit: 2.0
-  tile_grid_size: [8, 8]
+  enabled: true       # false = désactiver CLAHE (utile pour tests A/B)
+  clip_limit: 2.0     # seuil de contraste (plus élevé = plus agressif)
+  tile_grid_size: [8, 8]  # taille de la grille de tuiles
 
 ui:
   mode: full          # full | off

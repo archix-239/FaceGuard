@@ -22,15 +22,13 @@ Ces améliorations s'appliquent au code existant, sans retraining ni changement 
 - **Statut** : **FAIT** (2026-04-16) — `prob_history` (deque, 10 entrées) + sparkline confiance sous chaque bbox
 - **Réf.** : [Deramgozin2023] Ch.2
 
-### 1.3 — Exposer les paramètres d'augmentation CLAHE dans la config
+### 1.3 — ~~Exposer les paramètres d'augmentation CLAHE dans la config~~ FAIT
 - **Complexité** : 1/5 — **Priorité** : P2 — **Effort** : 10 min
-- **Description** : Rendre `clip_limit` et `tile_grid_size` ajustables par l'utilisateur via `default.yaml`
-- **Note** : Déjà partiellement fait — vérifier et documenter
+- **Statut** : **FAIT** (2026-04-16) — `clip_limit`, `tile_grid_size` et toggle `enabled` dans `default.yaml`
 
-### 1.4 — Toggle runtime GPU/CPU (hotkey ou flag CLI)
+### 1.4 — ~~Toggle runtime GPU/CPU (hotkey ou flag CLI)~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 1h
-- **Description** : Permettre de forcer CPU via `--cpu` en ligne de commande pour les tests de performance comparatifs
-- **Réf.** : [Deramgozin2023] Ch.5 — comparaison des performances embarquées
+- **Statut** : **FAIT** (2026-04-16) — flag `--cpu` désactive le GPU via config
 
 ### 1.5 — Snapshot sur touche (capture du visage aligné actuel)
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 30 min

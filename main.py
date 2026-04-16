@@ -166,7 +166,8 @@ def preprocess_face(
     aligned = align_face(frame_bgr, landmarks, target_size)
     if aligned is None:
         return None
-    aligned = apply_clahe_lab(aligned, clahe)
+    if clahe is not None:
+        aligned = apply_clahe_lab(aligned, clahe)
     rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
     return rgb.astype(np.float32) / 255.0
 
@@ -320,10 +321,15 @@ def run(cfg: dict) -> None:
 
     # --- CLAHE ---
     clahe_cfg = cfg.get("clahe", {})
-    clahe = cv2.createCLAHE(
-        clipLimit=clahe_cfg.get("clip_limit", 2.0),
-        tileGridSize=tuple(clahe_cfg.get("tile_grid_size", [8, 8])),
-    )
+    if clahe_cfg.get("enabled", True):
+        clahe = cv2.createCLAHE(
+            clipLimit=clahe_cfg.get("clip_limit", 2.0),
+            tileGridSize=tuple(clahe_cfg.get("tile_grid_size", [8, 8])),
+        )
+        print(f"[CLAHE] clip_limit={clahe_cfg.get('clip_limit', 2.0)}, tile={clahe_cfg.get('tile_grid_size', [8, 8])}")
+    else:
+        clahe = None
+        print("[CLAHE] Désactivé")
 
     # --- Camera ---
     cam_cfg = cfg["camera"]
@@ -537,6 +543,8 @@ def main() -> None:
     parser.add_argument("--ui", choices=("full", "off"), default=None)
     parser.add_argument("--backend", choices=("auto", "keras", "tflite"), default=None,
                         help="Forcer le backend d'inférence")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Forcer l'utilisation du CPU (désactive le GPU)")
     parser.add_argument("--camera", type=int, default=None, help="Index de la caméra")
     args = parser.parse_args()
 
@@ -545,6 +553,8 @@ def main() -> None:
         cfg["ui"]["mode"] = args.ui
     if args.backend:
         cfg["inference"]["backend"] = args.backend
+    if args.cpu:
+        cfg["gpu"]["enabled"] = False
     if args.camera is not None:
         cfg["camera"]["index"] = args.camera
 
