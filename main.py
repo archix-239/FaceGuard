@@ -105,13 +105,31 @@ class FaceTrack:
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
-def landmarks_to_bbox(landmarks, w: int, h: int) -> tuple:
-    xs = [lm.x * w for lm in landmarks]
-    ys = [lm.y * h for lm in landmarks]
-    x = max(0, int(min(xs)))
-    y = max(0, int(min(ys)))
-    bw = min(w - x, int(max(xs) - min(xs)))
-    bh = min(h - y, int(max(ys) - min(ys)))
+# Landmarks structurels du contour facial (FaceMesh 468 points)
+_FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454,
+              323, 361, 288, 397, 365, 379, 378, 400, 377,
+              152, 148, 176, 149, 150, 136, 172, 58, 132,
+              93, 234, 127, 162, 21, 54, 103, 67, 109]
+
+def landmarks_to_bbox(landmarks, w: int, h: int, margin: float = 0.1) -> tuple:
+    """Bbox depuis le contour facial (oval) avec marge configurable."""
+    oval_xs = [landmarks[i].x * w for i in _FACE_OVAL if i < len(landmarks)]
+    oval_ys = [landmarks[i].y * h for i in _FACE_OVAL if i < len(landmarks)]
+    if not oval_xs:
+        oval_xs = [lm.x * w for lm in landmarks]
+        oval_ys = [lm.y * h for lm in landmarks]
+
+    x_min, x_max = min(oval_xs), max(oval_xs)
+    y_min, y_max = min(oval_ys), max(oval_ys)
+    bw = x_max - x_min
+    bh = y_max - y_min
+
+    # Marge proportionnelle
+    mx, my = bw * margin, bh * margin
+    x = max(0, int(x_min - mx))
+    y = max(0, int(y_min - my))
+    bw = min(w - x, int(bw + 2 * mx))
+    bh = min(h - y, int(bh + 2 * my))
     return (x, y, bw, bh)
 
 
@@ -672,6 +690,47 @@ def run(cfg: dict) -> None:
                         saved += 1
                     if saved == 0:
                         print("[Capture] Aucune prédiction disponible — attendre quelques secondes")
+
+                if key == ord("l") and hasattr(backend, "model"):
+                    for i, track in enumerate(tracks):
+                        if track.last_landmarks is None or track._smooth_probs is None:
+                            continue
+                        face = preprocess_face(work, track.last_landmarks, clahe, input_size,
+                                               eye_width_ratio, eye_y_position, normalize_mode)
+                        if face is None:
+                            continue
+                        print("[LIME] Génération en cours (peut prendre 10-30s)...")
+                        from lime import lime_image
+                        explainer = lime_image.LimeImageExplainer()
+                        def _predict_fn(images):
+                            imgs = images.astype(np.float32) / 255.0
+                            return backend.predict_batch(imgs)
+                        face_uint8 = (face * 255).astype(np.uint8)
+                        explanation = explainer.explain_instance(
+                            face_uint8, _predict_fn,
+                            top_labels=1, hide_color=0, num_samples=200,
+                        )
+                        top_label = explanation.top_labels[0]
+                        temp, mask = explanation.get_image_and_mask(
+                            top_label, positive_only=False, num_features=10, hide_rest=False,
+                        )
+                        # Superposer le masque en couleur : vert = contribue, rouge = contre
+                        lime_vis = face_uint8.copy()
+                        green_overlay = np.zeros_like(lime_vis)
+                        green_overlay[mask == 1] = [0, 255, 0]
+                        red_overlay = np.zeros_like(lime_vis)
+                        red_overlay[mask == -1] = [255, 0, 0]
+                        lime_vis = cv2.addWeighted(lime_vis, 0.6, green_overlay, 0.4, 0)
+                        lime_vis = cv2.addWeighted(lime_vis, 1.0, red_overlay, 0.4, 0)
+                        lime_overlay = cv2.cvtColor(lime_vis, cv2.COLOR_RGB2BGR)
+                        cap_dir = "captures"
+                        os.makedirs(cap_dir, exist_ok=True)
+                        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                        path = f"{cap_dir}/{ts}_lime_face{i}.png"
+                        cv2.imwrite(path, lime_overlay)
+                        emo = emotion_classes[top_label]
+                        print(f"[LIME] {path} — {emo}")
+                        break
 
     finally:
         stop.set()

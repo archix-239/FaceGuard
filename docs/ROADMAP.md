@@ -50,10 +50,10 @@ Améliorations de qualité sans retraining du modèle principal.
 - **Statut** : **FAIT** (2026-04-16) — `eye_width_ratio` (0.40→0.34) et `eye_y_position` (0.38→0.36) configurables
 - **Réf.** : [Deramgozin2023] Ch.2
 
-### 2.3 — Détection de visage via FaceMesh plutôt que bbox MediaPipe
+### 2.3 — ~~Détection de visage via FaceMesh plutôt que bbox MediaPipe~~ FAIT
 - **Complexité** : 3/5 — **Priorité** : P2 — **Effort** : 3h
-- **Description** : Dériver le bbox depuis l'enveloppe convexe des 468 landmarks → plus stable qu'un bbox direct
-- **Réf.** : [Jan2017] Ch.4.3.2 — alignment par landmarks donne des crops cohérents
+- **Statut** : **FAIT** (2026-04-16) — bbox dérivé du contour facial (36 landmarks oval) + marge 10%
+- **Réf.** : [Jan2017] Ch.4.3.2
 
 ### 2.4 — ~~Normalisation d'intensité globale (histogramme ou z-score)~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 1h
@@ -71,10 +71,10 @@ Ajoute de la visibilité sur les décisions du modèle, sans changer le modèle.
 - **Statut** : **FAIT** (2026-04-16) — heatmap Grad-CAM superposée sur le bbox (35% opacité, JET colormap)
 - **Réf.** : [Deramgozin2023] Ch.3.5.3
 
-### 3.2 — LIME pour expliquer les prédictions à la demande
+### 3.2 — ~~LIME pour expliquer les prédictions à la demande~~ FAIT
 - **Complexité** : 4/5 — **Priorité** : P3 — **Effort** : 1 jour
-- **Description** : Touche `L` pour lancer LIME sur le crop courant et afficher les super-pixels discriminants
-- **Réf.** : [Deramgozin2023] Ch.2.3, Section LIME
+- **Statut** : **FAIT** (2026-04-16) — touche `L` génère une explication LIME sauvegardée dans `captures/`
+- **Réf.** : [Deramgozin2023] Ch.2.3
 
 ### 3.3 — ~~Mapping émotion → AU affichées en surimpression~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 2h
