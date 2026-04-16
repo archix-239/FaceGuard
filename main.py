@@ -162,11 +162,12 @@ def face_quality(frame_bgr: np.ndarray, landmarks, bbox: tuple) -> dict:
 # Face alignment & preprocessing
 # ---------------------------------------------------------------------------
 
-def align_face(frame_bgr: np.ndarray, landmarks, target_size: int = 224):
+def align_face(frame_bgr: np.ndarray, landmarks, target_size: int = 224,
+               eye_width_ratio: float = 0.34, eye_y_position: float = 0.36):
     """
     Affine-warp the frame so the face is centered, upright and consistently
-    scaled.  Eyes are placed at (target/2, target*0.38) with inter-eye
-    distance = 40% of target width — standard face-alignment convention.
+    scaled.  eye_width_ratio contrôle la marge contextuelle (plus petit = plus
+    de marge autour du visage).
     """
     h, w = frame_bgr.shape[:2]
 
@@ -181,12 +182,12 @@ def align_face(frame_bgr: np.ndarray, landmarks, target_size: int = 224):
     if eye_dist < 1.0:
         return None
 
-    scale = (target_size * 0.40) / eye_dist
+    scale = (target_size * eye_width_ratio) / eye_dist
     eye_cx, eye_cy = (lx + rx) / 2.0, (ly + ry) / 2.0
 
     M = cv2.getRotationMatrix2D((eye_cx, eye_cy), angle, scale)
     M[0, 2] += target_size / 2.0 - eye_cx
-    M[1, 2] += target_size * 0.38 - eye_cy
+    M[1, 2] += target_size * eye_y_position - eye_cy
 
     return cv2.warpAffine(
         frame_bgr, M, (target_size, target_size),
@@ -208,9 +209,11 @@ def preprocess_face(
     landmarks,
     clahe,
     target_size: int = 224,
+    eye_width_ratio: float = 0.34,
+    eye_y_position: float = 0.36,
 ) -> np.ndarray | None:
     """Full pipeline: align → CLAHE on L (LAB) → RGB → normalize [0, 1]."""
-    aligned = align_face(frame_bgr, landmarks, target_size)
+    aligned = align_face(frame_bgr, landmarks, target_size, eye_width_ratio, eye_y_position)
     if aligned is None:
         return None
     if clahe is not None:
@@ -373,6 +376,11 @@ def run(cfg: dict) -> None:
     print(f"[Backend] {details.backend.upper()} sur {details.device} — entrée {input_size}x{input_size}")
     backend.warmup((1, input_size, input_size, 3), runs=inf_cfg.get("warmup_runs", 2))
 
+    # --- Alignment ---
+    align_cfg = cfg.get("alignment", {})
+    eye_width_ratio = align_cfg.get("eye_width_ratio", 0.34)
+    eye_y_position = align_cfg.get("eye_y_position", 0.36)
+
     # --- CLAHE ---
     clahe_cfg = cfg.get("clahe", {})
     if clahe_cfg.get("enabled", True):
@@ -440,16 +448,20 @@ def run(cfg: dict) -> None:
                 job = infer_q.get(timeout=0.5)
             except queue.Empty:
                 continue
-            batch, job_tracks = job
-            if backend.supports_batch:
-                preds = backend.predict_batch(batch)
-            else:
-                preds = np.stack(
-                    [backend.predict(batch[i:i+1]) for i in range(batch.shape[0])]
-                )
-            with infer_lock:
-                for track, pred in zip(job_tracks, preds):
-                    track.add_prediction(pred)
+            try:
+                batch, job_tracks = job
+                if backend.supports_batch:
+                    preds = backend.predict_batch(batch)
+                else:
+                    preds = np.stack(
+                        [backend.predict(batch[i:i+1]) for i in range(batch.shape[0])]
+                    )
+                with infer_lock:
+                    for track, pred in zip(job_tracks, preds):
+                        track.add_prediction(pred)
+            except Exception:
+                if stop.is_set():
+                    break
 
     threading.Thread(target=_infer_worker, daemon=True).start()
 
@@ -558,7 +570,8 @@ def run(cfg: dict) -> None:
                     track.quality = q
                     if q["overall"] < quality_threshold:
                         continue
-                    face = preprocess_face(work, track.last_landmarks, clahe, input_size)
+                    face = preprocess_face(work, track.last_landmarks, clahe, input_size,
+                                           eye_width_ratio, eye_y_position)
                     if face is not None:
                         batch_faces.append(face)
                         batch_tracks.append(track)
@@ -597,7 +610,8 @@ def run(cfg: dict) -> None:
                     for i, track in enumerate(tracks):
                         if track.last_landmarks is None or track._smooth_probs is None:
                             continue
-                        face = preprocess_face(work, track.last_landmarks, clahe, input_size)
+                        face = preprocess_face(work, track.last_landmarks, clahe, input_size,
+                                               eye_width_ratio, eye_y_position)
                         if face is None:
                             continue
                         img_bgr = cv2.cvtColor((face * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)

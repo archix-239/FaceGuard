@@ -45,10 +45,10 @@ Améliorations de qualité sans retraining du modèle principal.
 - **Statut** : **FAIT** (2026-04-16) — `face_quality()` évalue taille, angle, netteté ; seuil configurable `quality_threshold`
 - **Réf.** : [Jan2017] Ch.1, Section 1.2.1
 
-### 2.2 — Crop élargi avec marge contextuelle
+### 2.2 — ~~Crop élargi avec marge contextuelle~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P1 — **Effort** : 1h
-- **Description** : Au lieu de cropper strictement au bbox, inclure 15–20% de marge autour (menton, front) comme le fait Deramgozin
-- **Réf.** : [Deramgozin2023] Ch.2 — pipeline de prétraitement
+- **Statut** : **FAIT** (2026-04-16) — `eye_width_ratio` (0.40→0.34) et `eye_y_position` (0.38→0.36) configurables
+- **Réf.** : [Deramgozin2023] Ch.2
 
 ### 2.3 — Détection de visage via FaceMesh plutôt que bbox MediaPipe
 - **Complexité** : 3/5 — **Priorité** : P2 — **Effort** : 3h

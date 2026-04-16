@@ -21,6 +21,10 @@ camera:
   width: 1280
   height: 720
 
+alignment:
+  eye_width_ratio: 0.34  # distance inter-oculaire / largeur cible (plus petit = plus de marge)
+  eye_y_position: 0.36   # position verticale des yeux (% depuis le haut)
+
 # CLAHE appliqué sur canal L (espace LAB) — préserve la couleur
 clahe:
   enabled: true       # false = désactiver CLAHE (utile pour tests A/B)
