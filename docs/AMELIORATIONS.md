@@ -201,6 +201,51 @@ explicite du `memory_growth` pour éviter de réserver toute la VRAM au démarra
 
 ---
 
+## [2026-04-16] — Affichage de la confiance dans l'UI (Roadmap 1.1)
+
+### Modifications
+- `draw_face()` affiche le score de confiance EMA à côté du label : `HAPPY  87%`
+- Format : `f"{emo}  {conf:.0%}"` — déjà présent depuis le pack d'améliorations initial
+- Ajout de `--backend` en CLI pour forcer le backend d'inférence (`auto`, `keras`, `tflite`)
+- La taille d'entrée est maintenant lue automatiquement depuis le backend (`details().input_shape`)
+  → plus besoin de synchroniser manuellement `model_input_size` avec le modèle chargé
+
+### Pourquoi
+Afficher la confiance permet de voir instantanément si le modèle hésite entre deux classes
+(confiance basse, ~30–40%) ou s'il est certain de sa prédiction (>80%).
+
+> Référence **[Deramgozin2023]** — Ch. 2 : Deramgozin recommande la visualisation des
+> probabilités de sortie pour interpréter et debugger les prédictions en temps réel.
+
+### Résultat
+- L'utilisateur voit `HAPPY  92%` ou `NEUTRAL  45%` directement sur le visage
+- Le flag `--backend tflite` permet de tester sur CPU sans GPU avec le modèle léger 48×48
+
+---
+
+## [2026-04-16] — Buffer de probabilités et sparkline (Roadmap 1.2)
+
+### Modifications
+- `FaceTrack` : ajout de `prob_history` (deque de 10 vecteurs de probabilités lissées EMA)
+- Chaque appel à `add_prediction()` pousse le vecteur lissé dans l'historique
+- `_draw_prob_sparkline()` : mini-graphe semi-transparent sous le bbox de chaque visage,
+  traçant l'évolution de `max(smooth_probs)` sur les 10 dernières inférences
+- Fond noir 50% opacité pour lisibilité, trait de la couleur de l'émotion dominante
+
+### Pourquoi
+Visualiser l'évolution temporelle de la confiance permet de détecter :
+- les **oscillations** (modèle qui hésite entre deux émotions)
+- les **transitions** (changement d'expression en cours)
+- les **faux positifs** (confiance qui monte puis redescend brusquement)
+
+> Référence **[Deramgozin2023]** — Ch. 2 : analyse de la cohérence temporelle des prédictions.
+
+### Résultat
+- Un mini-graphe apparaît sous chaque visage détecté, montrant la trajectoire de confiance
+- Visible dès la 2ème inférence sur une piste donnée
+
+---
+
 ## Améliorations planifiées (issues des travaux de recherche)
 
 ### [PLANIFIÉ] Mécanisme d'attention canal + spatial

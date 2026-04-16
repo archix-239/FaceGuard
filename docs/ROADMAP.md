@@ -12,15 +12,14 @@ Chaque entrée indique : **complexité** (1=trivial → 5=refonte majeure), **pr
 
 Ces améliorations s'appliquent au code existant, sans retraining ni changement d'architecture.
 
-### 1.1 — Afficher la confiance de la prédiction (%) dans l'UI
+### 1.1 — ~~Afficher la confiance de la prédiction (%) dans l'UI~~ FAIT
 - **Complexité** : 1/5 — **Priorité** : P0 — **Effort** : 15 min
-- **Description** : Ajouter le score de probabilité `max(smooth_probs) * 100` à côté du label d'émotion dans l'overlay OpenCV
-- **Pourquoi** : Permet de visualiser immédiatement la stabilité EMA et de détecter les cas où le modèle hésite entre deux classes
-- **Réf.** : [Deramgozin2023] Ch.2 — visualisation des probabilités de sortie pour interprétation
+- **Statut** : **FAIT** (2026-04-16) — déjà implémenté dans `draw_face()` : `f"{emo}  {conf:.0%}"`
+- Ajout du flag `--backend` en CLI et lecture auto de la taille d'entrée depuis le backend
 
-### 1.2 — Buffer de probabilités par piste (historique court)
+### 1.2 — ~~Buffer de probabilités par piste (historique court)~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P1 — **Effort** : 30 min
-- **Description** : Stocker les 10 derniers vecteurs de probabilités dans chaque `FaceTrack` pour permettre une visualisation graphique de l'évolution
+- **Statut** : **FAIT** (2026-04-16) — `prob_history` (deque, 10 entrées) + sparkline confiance sous chaque bbox
 - **Réf.** : [Deramgozin2023] Ch.2
 
 ### 1.3 — Exposer les paramètres d'augmentation CLAHE dans la config

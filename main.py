@@ -42,12 +42,14 @@ class FaceTrack:
     """MOSSE tracker + EMA emotion smoothing for one face."""
 
     EMA_ALPHA = 0.35  # higher = more reactive, lower = smoother
+    HISTORY_LEN = 10  # nombre de vecteurs de probabilités conservés
 
     def __init__(self, frame_gray: np.ndarray, bbox: tuple) -> None:
         self.bbox = bbox
         self.missed = 0
         self.last_landmarks = None
         self._smooth_probs: np.ndarray | None = None
+        self.prob_history: deque = deque(maxlen=self.HISTORY_LEN)
         self._tracker = cv2.legacy.TrackerMOSSE.create()
         self._tracker.init(frame_gray, bbox)
 
@@ -74,6 +76,7 @@ class FaceTrack:
             self._smooth_probs = (
                 self.EMA_ALPHA * probs + (1.0 - self.EMA_ALPHA) * self._smooth_probs
             )
+        self.prob_history.append(self._smooth_probs.copy())
 
     def dominant_emotion(self, emotion_classes: list) -> tuple:
         if self._smooth_probs is None:
@@ -172,6 +175,58 @@ def preprocess_face(
 # Rendering
 # ---------------------------------------------------------------------------
 
+def _draw_prob_sparkline(
+    frame: np.ndarray,
+    history: deque,
+    x: int, y: int, w: int, h: int,
+    color: tuple,
+) -> None:
+    """Mini-graphe de l'évolution de la confiance dominante (sparkline)."""
+    if len(history) < 2:
+        return
+    confs = [float(np.max(p)) for p in history]
+    n = len(confs)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+    step = w / max(n - 1, 1)
+    for i in range(n - 1):
+        x1 = int(x + i * step)
+        y1 = int(y + h - confs[i] * h)
+        x2 = int(x + (i + 1) * step)
+        y2 = int(y + h - confs[i + 1] * h)
+        cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+
+
+def _draw_prob_bars(
+    frame: np.ndarray,
+    probs: np.ndarray,
+    emotion_classes: list,
+    x: int, y: int,
+    bar_w: int = 100,
+    bar_h: int = 14,
+    gap: int = 2,
+) -> None:
+    """Barres horizontales de probabilité pour chaque émotion, à droite du bbox."""
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1
+    panel_h = len(emotion_classes) * (bar_h + gap)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + bar_w + 70, y + panel_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    dominant_idx = int(np.argmax(probs))
+    for i, cls in enumerate(emotion_classes):
+        py = y + i * (bar_h + gap)
+        p = float(probs[i])
+        color = EMOTION_COLORS.get(cls, (180, 180, 180))
+        fill_w = int(p * bar_w)
+        if i == dominant_idx:
+            cv2.rectangle(frame, (x, py), (x + bar_w, py + bar_h), color, 1)
+        cv2.rectangle(frame, (x, py), (x + fill_w, py + bar_h), color, -1)
+        txt = f"{cls[:3]} {p:.0%}"
+        cv2.putText(frame, txt, (x + bar_w + 4, py + bar_h - 2), font, scale, (220, 220, 220), thick)
+
+
 def draw_face(
     frame: np.ndarray,
     bbox: tuple,
@@ -188,6 +243,13 @@ def draw_face(
         (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
         cv2.rectangle(frame, (x, y - th - 10), (x + tw + 6, y), color, -1)
         cv2.putText(frame, label, (x + 3, y - 5), font, scale, (0, 0, 0), thick)
+
+    if track._smooth_probs is not None:
+        _draw_prob_bars(frame, track._smooth_probs, emotion_classes, x + w + 8, y)
+
+    if len(track.prob_history) >= 2:
+        spark_h = max(20, h // 5)
+        _draw_prob_sparkline(frame, track.prob_history, x, y + h + 4, w, spark_h, color)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +313,9 @@ def run(cfg: dict) -> None:
         tflite_model_path=inf_cfg.get("tflite_model_path"),
         tflite_num_threads=inf_cfg.get("tflite_num_threads", 2),
     )
-    input_size = cfg.get("model_input_size", 224)
+    details = backend.details()
+    input_size = details.input_shape[1] if details.input_shape else cfg.get("model_input_size", 224)
+    print(f"[Backend] {details.backend.upper()} sur {details.device} — entrée {input_size}x{input_size}")
     backend.warmup((1, input_size, input_size, 3), runs=inf_cfg.get("warmup_runs", 2))
 
     # --- CLAHE ---
@@ -304,6 +368,29 @@ def run(cfg: dict) -> None:
             frame_q.put(frame)
 
     threading.Thread(target=_capture, daemon=True).start()
+
+    # --- Inference thread (non-bloquant pour l'UI) ---
+    infer_q: queue.Queue = queue.Queue(maxsize=1)
+    infer_lock = threading.Lock()
+
+    def _infer_worker() -> None:
+        while not stop.is_set():
+            try:
+                job = infer_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            batch, job_tracks = job
+            if backend.supports_batch:
+                preds = backend.predict_batch(batch)
+            else:
+                preds = np.stack(
+                    [backend.predict(batch[i:i+1]) for i in range(batch.shape[0])]
+                )
+            with infer_lock:
+                for track, pred in zip(job_tracks, preds):
+                    track.add_prediction(pred)
+
+    threading.Thread(target=_infer_worker, daemon=True).start()
 
     ui_mode = cfg["ui"]["mode"]
     window_name = cfg["ui"]["window_name"]
@@ -397,7 +484,7 @@ def run(cfg: dict) -> None:
                 tracks = [t for t in tracks if t.missed <= max_missed]
 
             # ----------------------------------------------------------------
-            # Inference — throttled (~6 Hz)
+            # Inference — envoi au thread (non-bloquant)
             # ----------------------------------------------------------------
             if tracks and now_ms - last_infer_ms >= infer_interval_ms:
                 last_infer_ms = now_ms
@@ -411,16 +498,12 @@ def run(cfg: dict) -> None:
                         batch_faces.append(face)
                         batch_tracks.append(track)
 
-                if batch_faces:
+                if batch_faces and infer_q.empty():
                     batch = np.stack(batch_faces, axis=0)
-                    if backend.supports_batch:
-                        preds = backend.predict_batch(batch)
-                    else:
-                        preds = np.stack(
-                            [backend.predict(f[np.newaxis]) for f in batch_faces]
-                        )
-                    for track, pred in zip(batch_tracks, preds):
-                        track.add_prediction(pred)
+                    try:
+                        infer_q.put_nowait((batch, list(batch_tracks)))
+                    except queue.Full:
+                        pass
 
             # ----------------------------------------------------------------
             # Render
@@ -452,12 +535,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="FaceGuard – Emotion Recognition")
     parser.add_argument("--config", default=None, help="Chemin vers un fichier YAML de config")
     parser.add_argument("--ui", choices=("full", "off"), default=None)
+    parser.add_argument("--backend", choices=("auto", "keras", "tflite"), default=None,
+                        help="Forcer le backend d'inférence")
     parser.add_argument("--camera", type=int, default=None, help="Index de la caméra")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.ui:
         cfg["ui"]["mode"] = args.ui
+    if args.backend:
+        cfg["inference"]["backend"] = args.backend
     if args.camera is not None:
         cfg["camera"]["index"] = args.camera
 
