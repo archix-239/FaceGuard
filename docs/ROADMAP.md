@@ -77,11 +77,10 @@ Ajoute de la visibilité sur les décisions du modèle, sans changer le modèle.
 - **Description** : Touche `L` pour lancer LIME sur le crop courant et afficher les super-pixels discriminants
 - **Réf.** : [Deramgozin2023] Ch.2.3, Section LIME
 
-### 3.3 — Mapping émotion → AU affichées en surimpression
+### 3.3 — ~~Mapping émotion → AU affichées en surimpression~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 2h
-- **Description** : Afficher les AU attendues pour l'émotion prédite (ex. JOIE → AU6+AU12)
-- **Réf.** : [Deramgozin2023] Table 3.1 — table FACS complète
-- **Bénéfice** : Pédagogique et utile pour debug
+- **Statut** : **FAIT** (2026-04-16) — table FACS `EMOTION_AUS` + AU affichées sous le bbox
+- **Réf.** : [Deramgozin2023] Table 3.1
 
 ---
 

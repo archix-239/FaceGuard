@@ -29,6 +29,18 @@ EMOTION_COLORS = {
     "SURPRISE": (  0, 190, 255),
 }
 
+# Table FACS — AU attendues par émotion (Ekman & Friesen, Deramgozin2023 Table 3.1)
+EMOTION_AUS = {
+    "ANGRY":    "AU4+5+7+23",
+    "CONTEMPT": "AU12+14",
+    "DISGUST":  "AU9+15+17",
+    "FEAR":     "AU1+2+4+5+7+20+26",
+    "HAPPY":    "AU6+12",
+    "NEUTRAL":  "—",
+    "SAD":      "AU1+4+15",
+    "SURPRISE": "AU1+2+5+26",
+}
+
 # MediaPipe 468-point mesh — eye corner indices
 _L_EYE_INNER = 133
 _L_EYE_OUTER = 33
@@ -304,11 +316,16 @@ def draw_face(
         cv2.rectangle(frame, (x, y - th - 10), (x + tw + 6, y), color, -1)
         cv2.putText(frame, label, (x + 3, y - 5), font, scale, (0, 0, 0), thick)
 
+    if emo and emo in EMOTION_AUS:
+        au_label = EMOTION_AUS[emo]
+        cv2.putText(frame, au_label, (x, y + h + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
     if track.quality is not None:
         q = track.quality["overall"]
         q_color = (0, 200, 0) if q >= 0.6 else (0, 200, 255) if q >= 0.3 else (0, 0, 200)
         q_label = f"Q:{q:.0%}"
-        cv2.putText(frame, q_label, (x, y + h + 15),
+        cv2.putText(frame, q_label, (x, y + h + 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, q_color, 1)
 
     if track._smooth_probs is not None:
