@@ -63,6 +63,7 @@ class FaceTrack:
         self.missed = 0
         self.last_landmarks = None
         self.quality: dict | None = None
+        self.gradcam_map: np.ndarray | None = None
         self._smooth_probs: np.ndarray | None = None
         self.prob_history: deque = deque(maxlen=self.HISTORY_LEN)
         self._tracker = cv2.legacy.TrackerMOSSE.create()
@@ -309,6 +310,19 @@ def draw_face(
     emo, conf = track.dominant_emotion(emotion_classes)
     color = EMOTION_COLORS.get(emo, (200, 200, 200)) if emo else (200, 200, 200)
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+    if track.gradcam_map is not None and w > 10 and h > 10:
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(fw, x + w), min(fh, y + h)
+        roi_w, roi_h = x2 - x1, y2 - y1
+        if roi_w > 0 and roi_h > 0:
+            cam_resized = cv2.resize(track.gradcam_map, (roi_w, roi_h),
+                                     interpolation=cv2.INTER_LINEAR)
+            heatmap = cv2.applyColorMap((cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            roi = frame[y1:y2, x1:x2]
+            cv2.addWeighted(heatmap, 0.5, roi, 0.5, 0, roi)
+
     if emo:
         label = f"{emo}  {conf:.0%}"
         font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2
@@ -485,8 +499,11 @@ def run(cfg: dict) -> None:
                         [backend.predict(batch[i:i+1]) for i in range(batch.shape[0])]
                     )
                 with infer_lock:
-                    for track, pred in zip(job_tracks, preds):
+                    for i, (track, pred) in enumerate(zip(job_tracks, preds)):
                         track.add_prediction(pred)
+                        cam = backend.gradcam(batch[i:i+1])
+                        if cam is not None:
+                            track.gradcam_map = cam
             except Exception:
                 if stop.is_set():
                     break

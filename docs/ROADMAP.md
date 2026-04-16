@@ -66,11 +66,10 @@ Améliorations de qualité sans retraining du modèle principal.
 
 Ajoute de la visibilité sur les décisions du modèle, sans changer le modèle.
 
-### 3.1 — Grad-CAM overlay sur le visage
+### 3.1 — ~~Grad-CAM overlay sur le visage~~ FAIT
 - **Complexité** : 3/5 — **Priorité** : P1 — **Effort** : 4h
-- **Description** : Générer la heatmap Grad-CAM à partir de la dernière couche conv du ConvNeXt et la superposer (transparence 30%) sur le crop affiché
-- **Réf.** : [Deramgozin2023] Ch.3.5.3 — Grad-CAM comme outil clé d'interprétabilité des AU
-- **Bénéfice** : Voir immédiatement si le modèle regarde les bonnes régions (yeux/bouche)
+- **Statut** : **FAIT** (2026-04-16) — heatmap Grad-CAM superposée sur le bbox (35% opacité, JET colormap)
+- **Réf.** : [Deramgozin2023] Ch.3.5.3
 
 ### 3.2 — LIME pour expliquer les prédictions à la demande
 - **Complexité** : 4/5 — **Priorité** : P3 — **Effort** : 1 jour

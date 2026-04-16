@@ -32,6 +32,9 @@ class InferenceBackend:
         results = [self.predict(batch[i : i + 1]) for i in range(n)]
         return np.stack(results, axis=0)
 
+    def gradcam(self, tensor: np.ndarray, class_idx: int | None = None) -> np.ndarray | None:
+        return None
+
     def details(self) -> InferenceDetails:
         raise NotImplementedError
 
@@ -55,6 +58,8 @@ class KerasInferenceBackend(InferenceBackend):
         with tf.device(self._device):
             self.model = tf.keras.models.load_model(model_path, compile=False)
 
+        self._grad_model = self._build_grad_model()
+
         input_shape  = tuple(self.model.input_shape)
         output_shape = tuple(self.model.output_shape)
         self._details = InferenceDetails(
@@ -66,6 +71,30 @@ class KerasInferenceBackend(InferenceBackend):
             output_shape=output_shape,
             output_dtype="float32",
         )
+
+    def _build_grad_model(self):
+        """Build a model that outputs [last_conv_output, predictions]."""
+        try:
+            conv_layer = None
+            for layer in self.model.layers:
+                if hasattr(layer, "layers"):
+                    out = layer.output
+                    if hasattr(out, "shape") and len(out.shape) == 4:
+                        conv_layer = layer
+            if conv_layer is None:
+                return None
+            inp = tf.keras.Input(shape=self.model.input_shape[1:])
+            x = inp
+            conv_output = None
+            for layer in self.model.layers:
+                x = layer(x)
+                if layer is conv_layer:
+                    conv_output = x
+            if conv_output is None:
+                return None
+            return tf.keras.Model(inputs=inp, outputs=[conv_output, x])
+        except Exception:
+            return None
 
     @property
     def supports_batch(self) -> bool:
@@ -80,6 +109,29 @@ class KerasInferenceBackend(InferenceBackend):
         with tf.device(self._device):
             preds = self.model(batch, training=False)
         return np.asarray(preds, dtype=np.float32)
+
+    def gradcam(self, tensor: np.ndarray, class_idx: int | None = None) -> np.ndarray | None:
+        """Grad-CAM heatmap (H, W) float32 [0, 1] for the given input (1, H, W, C)."""
+        if self._grad_model is None:
+            return None
+
+        with tf.device(self._device):
+            inp = tf.cast(tensor, tf.float32)
+            with tf.GradientTape() as tape:
+                conv_out, preds = self._grad_model(inp, training=False)
+                if class_idx is None:
+                    class_idx = int(tf.argmax(preds[0]))
+                loss = preds[:, class_idx]
+            grads = tape.gradient(loss, conv_out)
+        if grads is None:
+            return None
+        weights = tf.reduce_mean(grads, axis=(1, 2), keepdims=True)
+        cam = tf.reduce_sum(conv_out * weights, axis=-1)[0]
+        cam = tf.nn.relu(cam)
+        cam_max = tf.reduce_max(cam)
+        if cam_max > 0:
+            cam = cam / cam_max
+        return cam.numpy().astype(np.float32)
 
     def details(self) -> InferenceDetails:
         return self._details
