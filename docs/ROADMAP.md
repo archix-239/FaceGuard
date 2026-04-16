@@ -55,10 +55,10 @@ Améliorations de qualité sans retraining du modèle principal.
 - **Description** : Dériver le bbox depuis l'enveloppe convexe des 468 landmarks → plus stable qu'un bbox direct
 - **Réf.** : [Jan2017] Ch.4.3.2 — alignment par landmarks donne des crops cohérents
 
-### 2.4 — Normalisation d'intensité globale (histogramme ou z-score)
+### 2.4 — ~~Normalisation d'intensité globale (histogramme ou z-score)~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 1h
-- **Description** : Après CLAHE, normaliser la distribution des pixels (soit z-score, soit min/max stretching)
-- **Réf.** : [Jan2017] Ch.3 — preprocessing pour robustesse d'illumination
+- **Statut** : **FAIT** (2026-04-16) — `preprocessing.normalize` configurable (`minmax` ou `zscore`)
+- **Réf.** : [Jan2017] Ch.3
 
 ---
 

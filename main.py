@@ -211,15 +211,24 @@ def preprocess_face(
     target_size: int = 224,
     eye_width_ratio: float = 0.34,
     eye_y_position: float = 0.36,
+    normalize: str = "minmax",
 ) -> np.ndarray | None:
-    """Full pipeline: align → CLAHE on L (LAB) → RGB → normalize [0, 1]."""
+    """Full pipeline: align → CLAHE on L (LAB) → RGB → normalize."""
     aligned = align_face(frame_bgr, landmarks, target_size, eye_width_ratio, eye_y_position)
     if aligned is None:
         return None
     if clahe is not None:
         aligned = apply_clahe_lab(aligned, clahe)
-    rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
-    return rgb.astype(np.float32) / 255.0
+    rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB).astype(np.float32)
+
+    if normalize == "zscore":
+        mean = rgb.mean()
+        std = rgb.std() + 1e-6
+        rgb = (rgb - mean) / std
+    else:
+        rgb = rgb / 255.0
+
+    return rgb
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +385,12 @@ def run(cfg: dict) -> None:
     print(f"[Backend] {details.backend.upper()} sur {details.device} — entrée {input_size}x{input_size}")
     backend.warmup((1, input_size, input_size, 3), runs=inf_cfg.get("warmup_runs", 2))
 
-    # --- Alignment ---
+    # --- Alignment & preprocessing ---
     align_cfg = cfg.get("alignment", {})
     eye_width_ratio = align_cfg.get("eye_width_ratio", 0.34)
     eye_y_position = align_cfg.get("eye_y_position", 0.36)
+    prep_cfg = cfg.get("preprocessing", {})
+    normalize_mode = prep_cfg.get("normalize", "minmax")
 
     # --- CLAHE ---
     clahe_cfg = cfg.get("clahe", {})
@@ -571,7 +582,7 @@ def run(cfg: dict) -> None:
                     if q["overall"] < quality_threshold:
                         continue
                     face = preprocess_face(work, track.last_landmarks, clahe, input_size,
-                                           eye_width_ratio, eye_y_position)
+                                           eye_width_ratio, eye_y_position, normalize_mode)
                     if face is not None:
                         batch_faces.append(face)
                         batch_tracks.append(track)
@@ -611,7 +622,7 @@ def run(cfg: dict) -> None:
                         if track.last_landmarks is None or track._smooth_probs is None:
                             continue
                         face = preprocess_face(work, track.last_landmarks, clahe, input_size,
-                                               eye_width_ratio, eye_y_position)
+                                               eye_width_ratio, eye_y_position, normalize_mode)
                         if face is None:
                             continue
                         img_bgr = cv2.cvtColor((face * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
