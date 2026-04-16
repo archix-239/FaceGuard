@@ -1,8 +1,10 @@
 import argparse
+import os
 import threading
 import queue
 import time
 from collections import deque
+from datetime import datetime
 
 import cv2
 import mediapipe as mp
@@ -527,8 +529,33 @@ def run(cfg: dict) -> None:
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 80), 2,
                 )
                 cv2.imshow(window_name, display)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
                     break
+                if key == ord("s"):
+                    cap_dir = "captures"
+                    os.makedirs(cap_dir, exist_ok=True)
+                    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                    saved = 0
+                    for i, track in enumerate(tracks):
+                        if track.last_landmarks is None or track._smooth_probs is None:
+                            continue
+                        face = preprocess_face(work, track.last_landmarks, clahe, input_size)
+                        if face is None:
+                            continue
+                        img_bgr = cv2.cvtColor((face * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                        path = f"{cap_dir}/{ts}_face{i}.png"
+                        cv2.imwrite(path, img_bgr)
+                        emo, conf = track.dominant_emotion(emotion_classes)
+                        probs_str = ", ".join(
+                            f"{c}: {p:.1%}" for c, p in zip(emotion_classes, track._smooth_probs)
+                        )
+                        with open(f"{cap_dir}/{ts}_face{i}.txt", "w") as f:
+                            f.write(f"emotion: {emo} ({conf:.1%})\n{probs_str}\n")
+                        print(f"[Capture] {path} — {emo} {conf:.0%}")
+                        saved += 1
+                    if saved == 0:
+                        print("[Capture] Aucune prédiction disponible — attendre quelques secondes")
 
     finally:
         stop.set()

@@ -30,10 +30,9 @@ Ces améliorations s'appliquent au code existant, sans retraining ni changement 
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 1h
 - **Statut** : **FAIT** (2026-04-16) — flag `--cpu` désactive le GPU via config
 
-### 1.5 — Snapshot sur touche (capture du visage aligné actuel)
+### 1.5 — ~~Snapshot sur touche (capture du visage aligné actuel)~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P2 — **Effort** : 30 min
-- **Description** : Touche `S` pour sauvegarder le crop 224×224 aligné + les probabilités dans `captures/YYYY-MM-DD_HHMMSS.png`
-- **Usage** : Debug et collecte de données pour retraining futur
+- **Statut** : **FAIT** (2026-04-16) — touche `S` sauvegarde crop + probas dans `captures/`
 
 ---
 
