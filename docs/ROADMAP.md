@@ -40,14 +40,10 @@ Ces améliorations s'appliquent au code existant, sans retraining ni changement 
 
 Améliorations de qualité sans retraining du modèle principal.
 
-### 2.1 — Tracking quality score (qualité du visage)
+### 2.1 — ~~Tracking quality score (qualité du visage)~~ FAIT
 - **Complexité** : 2/5 — **Priorité** : P1 — **Effort** : 2h
-- **Description** : Filtrer les prédictions sur les visages de mauvaise qualité (flou, angle > 30°, bbox trop petite < 64px)
-- **Réf.** : [Jan2017] Ch.1, Section 1.2.1 — « Pose variations, occlusions, illumination changes » dégradent la FER
-- **Implémentation** :
-  - Taille minimale bbox
-  - Angle inter-oculaire via `align_face`
-  - Variance du Laplacien pour détection de flou
+- **Statut** : **FAIT** (2026-04-16) — `face_quality()` évalue taille, angle, netteté ; seuil configurable `quality_threshold`
+- **Réf.** : [Jan2017] Ch.1, Section 1.2.1
 
 ### 2.2 — Crop élargi avec marge contextuelle
 - **Complexité** : 2/5 — **Priorité** : P1 — **Effort** : 1h

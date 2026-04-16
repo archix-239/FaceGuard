@@ -50,6 +50,7 @@ class FaceTrack:
         self.bbox = bbox
         self.missed = 0
         self.last_landmarks = None
+        self.quality: dict | None = None
         self._smooth_probs: np.ndarray | None = None
         self.prob_history: deque = deque(maxlen=self.HISTORY_LEN)
         self._tracker = cv2.legacy.TrackerMOSSE.create()
@@ -111,6 +112,50 @@ def bbox_iou(a: tuple, b: tuple) -> float:
     inter = (ix2 - ix1) * (iy2 - iy1)
     union = aw * ah + bw * bh - inter
     return inter / union if union > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Face quality assessment
+# ---------------------------------------------------------------------------
+
+def face_quality(frame_bgr: np.ndarray, landmarks, bbox: tuple) -> dict:
+    """
+    Évalue la qualité d'un visage détecté.
+    Retourne un dict avec les scores individuels et un score global [0, 1].
+    """
+    h, w = frame_bgr.shape[:2]
+    _, _, bw, bh = bbox
+
+    # 1. Taille minimale — bbox trop petite = détails insuffisants
+    min_dim = min(bw, bh)
+    size_score = min(1.0, min_dim / 64.0)
+
+    # 2. Angle inter-oculaire — rotation excessive = mauvaise normalisation
+    lx = (landmarks[_L_EYE_INNER].x + landmarks[_L_EYE_OUTER].x) / 2 * w
+    ly = (landmarks[_L_EYE_INNER].y + landmarks[_L_EYE_OUTER].y) / 2 * h
+    rx = (landmarks[_R_EYE_INNER].x + landmarks[_R_EYE_OUTER].x) / 2 * w
+    ry = (landmarks[_R_EYE_INNER].y + landmarks[_R_EYE_OUTER].y) / 2 * h
+    angle = abs(float(np.degrees(np.arctan2(ry - ly, rx - lx))))
+    angle_score = max(0.0, 1.0 - angle / 30.0)
+
+    # 3. Netteté — variance du Laplacien sur le crop
+    x, y = bbox[0], bbox[1]
+    crop = frame_bgr[max(0,y):min(h,y+bh), max(0,x):min(w,x+bw)]
+    if crop.size > 0:
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray_crop, cv2.CV_64F).var())
+        sharp_score = min(1.0, sharpness / 100.0)
+    else:
+        sharp_score = 0.0
+
+    overall = size_score * 0.3 + angle_score * 0.4 + sharp_score * 0.3
+
+    return {
+        "size": size_score,
+        "angle": angle_score,
+        "sharpness": sharp_score,
+        "overall": overall,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +292,13 @@ def draw_face(
         cv2.rectangle(frame, (x, y - th - 10), (x + tw + 6, y), color, -1)
         cv2.putText(frame, label, (x + 3, y - 5), font, scale, (0, 0, 0), thick)
 
+    if track.quality is not None:
+        q = track.quality["overall"]
+        q_color = (0, 200, 0) if q >= 0.6 else (0, 200, 255) if q >= 0.3 else (0, 0, 200)
+        q_label = f"Q:{q:.0%}"
+        cv2.putText(frame, q_label, (x, y + h + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, q_color, 1)
+
     if track._smooth_probs is not None:
         _draw_prob_bars(frame, track._smooth_probs, emotion_classes, x + w + 8, y)
 
@@ -351,6 +403,7 @@ def run(cfg: dict) -> None:
     detect_interval_ms = cfg["tracking"]["detect_every_ms"]
     infer_interval_ms = inf_cfg.get("infer_every_ms", 150)
     max_missed = cfg["tracking"]["max_missed_frames"]
+    quality_threshold = cfg["tracking"].get("quality_threshold", 0.3)
 
     tracks: list = []
     last_detect_ms = 0.0
@@ -500,6 +553,10 @@ def run(cfg: dict) -> None:
                 batch_tracks = []
                 for track in tracks:
                     if track.last_landmarks is None:
+                        continue
+                    q = face_quality(work, track.last_landmarks, track.bbox)
+                    track.quality = q
+                    if q["overall"] < quality_threshold:
                         continue
                     face = preprocess_face(work, track.last_landmarks, clahe, input_size)
                     if face is not None:

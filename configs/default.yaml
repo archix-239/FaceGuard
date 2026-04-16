@@ -54,3 +54,4 @@ tracking:
   max_faces: 4
   detect_every_ms: 400   # fréquence détection MediaPipe ~2.5 Hz
   max_missed_frames: 15  # frames avant suppression d'une piste perdue
+  quality_threshold: 0.3 # score qualité minimum pour lancer l'inférence (0.0–1.0)
